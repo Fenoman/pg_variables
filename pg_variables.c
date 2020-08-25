@@ -333,7 +333,7 @@ variable_insert(PG_FUNCTION_ARGS)
 	is_transactional = PG_GETARG_BOOL(3);
 
 	/* Get cached package */
-	if (LastPackage == NULL || GetActualState(LastPackage)->is_valid = false ||
+	if (LastPackage == NULL || GetActualState(LastPackage)->is_valid == false ||
 		VARSIZE_ANY_EXHDR(package_name) != strlen(GetName(LastPackage)) ||
 		strncmp(VARDATA_ANY(package_name), GetName(LastPackage),
 				VARSIZE_ANY_EXHDR(package_name)) != 0 ||
