@@ -963,12 +963,12 @@ removePackageInternal(Package *package)
 	}
 
 	/* Add to changes list */
-	transObject = &package->transObject;
-	if (!isObjectChangedInCurrentTrans(transObject))
-	{
-		createSavepoint(transObject, TRANS_PACKAGE);
-		addToChangesStack(transObject, TRANS_PACKAGE);
-	}
+	// transObject = &package->transObject;
+	// if (!isObjectChangedInCurrentTrans(transObject))
+	// {
+	// 	createSavepoint(transObject, TRANS_PACKAGE);
+	// 	addToChangesStack(transObject, TRANS_PACKAGE);
+	// }
 	GetActualState(package)->is_valid = false;
 	GetPackState(package)->trans_var_num = 0;
 }
