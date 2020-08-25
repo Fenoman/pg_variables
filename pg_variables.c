@@ -955,20 +955,20 @@ removePackageInternal(Package *package)
 		package->varHashRegular = NULL;
 	}
 
-	if (package->hctxTransact)
-	{
-		MemoryContextDelete(package->hctxTransact);
-		package->hctxTransact = NULL;
-		package->varHashTransact = NULL;
-	}
+	// if (package->hctxTransact)
+	// {
+	// 	MemoryContextDelete(package->hctxTransact);
+	// 	package->hctxTransact = NULL;
+	// 	package->varHashTransact = NULL;
+	// }
 
 	/* Add to changes list */
-	// transObject = &package->transObject;
-	// if (!isObjectChangedInCurrentTrans(transObject))
-	// {
-	// 	createSavepoint(transObject, TRANS_PACKAGE);
-	// 	addToChangesStack(transObject, TRANS_PACKAGE);
-	// }
+	transObject = &package->transObject;
+	if (!isObjectChangedInCurrentTrans(transObject))
+	{
+		createSavepoint(transObject, TRANS_PACKAGE);
+		addToChangesStack(transObject, TRANS_PACKAGE);
+	}
 	GetActualState(package)->is_valid = false;
 	GetPackState(package)->trans_var_num = 0;
 }
