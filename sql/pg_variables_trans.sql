@@ -773,6 +773,7 @@ SELECT pgv_remove('test', 'y');
 FETCH 1 in r1_cur;
 ROLLBACK;
 SELECT pgv_select('test', 'y');
+SELECT pgv_free();
 
 -- transactional, remove pack
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
@@ -782,6 +783,7 @@ SELECT pgv_remove('test');
 FETCH 1 in r1_cur;
 ROLLBACK;
 SELECT pgv_select('test', 'y');
+SELECT pgv_free();
 
 -- transactional, free
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);

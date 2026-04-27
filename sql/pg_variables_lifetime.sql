@@ -42,6 +42,41 @@ SELECT * FROM pgv_select('lifetime', 'rec',
 ORDER BY id;
 SELECT pgv_free();
 
+-- Active pgv_select cursors over a transactional record variable must be
+-- invalidated before pgv_remove(variable) can free/reinitialize its record hash.
+BEGIN;
+SELECT pgv_insert('uaf', 'x', ROW (1::int, 'a'::text), TRUE);
+SELECT pgv_insert('uaf', 'x', ROW (2::int, 'b'::text), TRUE);
+SELECT pgv_insert('uaf', 'x', ROW (3::int, 'c'::text), TRUE);
+DECLARE trans_var_cur CURSOR FOR
+SELECT pgv_select('uaf', 'x');
+MOVE 1 FROM trans_var_cur;
+SELECT pgv_remove('uaf', 'x');
+SELECT pgv_insert('uaf', 'x', ROW (99::int, 'z'::text), TRUE);
+FETCH ALL FROM trans_var_cur;
+ROLLBACK;
+SELECT pgv_free();
+
+-- Rolling back pgv_remove(transactional_variable) must restore the deletion
+-- flag as well as the previous value state.
+SELECT pgv_insert('rollback', 'rec', ROW (1::int, 'a'::text), TRUE);
+BEGIN;
+SELECT pgv_remove('rollback', 'rec');
+ROLLBACK;
+SELECT pgv_insert('rollback', 'rec', ROW (2::int, 'b'::text), TRUE);
+SELECT * FROM pgv_select('rollback', 'rec') AS t(id int, val text)
+ORDER BY id;
+SELECT pgv_free();
+
+-- Rollback of a transaction that created a record variable must terminate
+-- active scans before freeing that variable's only record state.
+BEGIN;
+SELECT pgv_insert('rollback_scan', 'rec', ROW (1::int, 'x'::text), TRUE);
+DECLARE rollback_scan_cur CURSOR FOR SELECT pgv_select('rollback_scan', 'rec');
+MOVE 1 FROM rollback_scan_cur;
+ROLLBACK;
+SELECT pgv_free();
+
 -- Active pgv_select(package, name, anyarray) cursors must be invalidated
 -- before the underlying record variable can be freed by pgv_free().
 SELECT pgv_insert('lifetime', 'rec', ROW (1::int, 'one'::text));

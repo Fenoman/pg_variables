@@ -2778,6 +2778,12 @@ SELECT pgv_select('test', 'y');
  (1,2)
 (1 row)
 
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
 -- transactional, remove pack
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
  pgv_insert 
@@ -2800,6 +2806,12 @@ SELECT pgv_select('test', 'y');
  pgv_select 
 ------------
  (1,2)
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
 (1 row)
 
 -- transactional, free
