@@ -1,5 +1,11 @@
 SELECT pgv_free();
 
+-- Cache hits must not bypass record/scalar type validation.
+SELECT pgv_set('cache', 'same', 1::int);
+SELECT pgv_insert('cache', 'same', ROW (1::int), FALSE); -- fail
+SELECT pgv_select('cache', 'same'); -- fail
+SELECT pgv_free();
+
 -- A by-reference scalar value returned by pgv_get() must not alias the
 -- stored value that can be replaced later in the same statement.
 SELECT pgv_set('lifetime', 'textval', 'aaaaaaaa'::text);
@@ -34,6 +40,18 @@ SELECT pgv_insert('lifetime', 'rec', ROW (2::int, 'two'::text));
 SELECT * FROM pgv_select('lifetime', 'rec',
                          ARRAY(SELECT generate_series(1, 2))) AS t(id int, label text)
 ORDER BY id;
+SELECT pgv_free();
+
+-- Active pgv_select(package, name, anyarray) cursors must be invalidated
+-- before the underlying record variable can be freed by pgv_free().
+SELECT pgv_insert('lifetime', 'rec', ROW (1::int, 'one'::text));
+SELECT pgv_insert('lifetime', 'rec', ROW (2::int, 'two'::text));
+BEGIN;
+DECLARE array_cur CURSOR FOR SELECT pgv_select('lifetime', 'rec', ARRAY[1, 2]);
+FETCH 1 FROM array_cur;
+SELECT pgv_free();
+FETCH ALL FROM array_cur;
+COMMIT;
 SELECT pgv_free();
 
 -- Active pgv_stats cursors must be invalidated before packagesHash can be

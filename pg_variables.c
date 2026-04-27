@@ -52,6 +52,13 @@ extern void _PG_fini(void);
 #endif
 static void ensurePackagesHashExists(void);
 static void getKeyFromName(text *name, char *key);
+static inline bool textNameEquals(text *name, const char *key);
+static inline bool cachedPackageMatches(text *name, bool is_trans,
+										bool require_htab);
+static inline bool cachedVariableMatches(text *name, Package *package);
+static Package *getCachedPackage(text *name, bool strict);
+static Variable *getCachedVariable(Package *package, text *name,
+									Oid typid, bool is_record, bool strict);
 
 static Package *getPackage(text *name, bool strict);
 static Package *createPackage(text *name, bool is_trans);
@@ -148,12 +155,10 @@ static MemoryContext changesStackContext = NULL;
  * So, in case user do not get all the data from set at once (use cursors or
  * LIMIT) we have to call hash_seq_term to not to leak hash_seq_search scans.
  *
- * For doing this, we alloc all of the rstats in the TopTransactionContext and
- * save pointers to the rstats into list. Once transaction ended (commited or
- * aborted) we clear all the "active" hash_seq_search by calling hash_seq_term.
- *
- * TopTransactionContext is handy here, because it would not be reset by the
- * time pgvTransCallback is called.
+ * For doing this, we keep global list cells in TopTransactionContext and
+ * make SRF memory context callbacks remove entries from these lists. Once
+ * transaction ended (committed or aborted) we clear all the active entries
+ * still present in these lists.
  */
 static List *variables_stats = NIL;
 static List *packages_stats = NIL;
@@ -634,6 +639,78 @@ static void packageStatEntryShutdown(void *arg);
 #define PGV_MCXT_STACK_NODE	"pg_variables: changesStackNode"
 
 
+static inline bool
+textNameEquals(text *name, const char *key)
+{
+	int			name_len = VARSIZE_ANY_EXHDR(name);
+
+	return name_len < NAMEDATALEN &&
+		key[name_len] == '\0' &&
+		memcmp(VARDATA_ANY(name), key, name_len) == 0;
+}
+
+static inline bool
+cachedPackageMatches(text *name, bool is_trans, bool require_htab)
+{
+	return LastPackage != NULL &&
+		textNameEquals(name, GetName(LastPackage)) &&
+		GetActualState(LastPackage)->is_valid &&
+		(!require_htab || pack_htab(LastPackage, is_trans) != NULL);
+}
+
+static inline bool
+cachedVariableMatches(text *name, Package *package)
+{
+	return LastVariable != NULL &&
+		LastVariable->package == package &&
+		textNameEquals(name, GetName(LastVariable)) &&
+		GetActualState(LastVariable)->is_valid;
+}
+
+static Package *
+getCachedPackage(text *name, bool strict)
+{
+	Package    *package;
+
+	if (cachedPackageMatches(name, false, false))
+		return LastPackage;
+
+	package = getPackage(name, strict);
+	if (package != NULL)
+	{
+		LastPackage = package;
+		LastVariable = NULL;
+	}
+
+	return package;
+}
+
+static Variable *
+getCachedVariable(Package *package, text *name, Oid typid, bool is_record,
+				  bool strict)
+{
+	Variable   *variable;
+
+	if (cachedVariableMatches(name, package))
+	{
+		variable = LastVariable;
+
+		if (typid == InvalidOid ||
+			(variable->typid == typid && variable->is_record == is_record))
+		{
+			LastPackage = package;
+			LastVariable = variable;
+			return variable;
+		}
+	}
+
+	variable = getVariableInternal(package, name, typid, is_record, strict);
+	if (variable != NULL && GetActualState(variable)->is_valid)
+		LastVariable = variable;
+
+	return variable;
+}
+
 #ifndef ALLOCSET_DEFAULT_SIZES
 #define ALLOCSET_DEFAULT_SIZES \
 	ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
@@ -656,9 +733,35 @@ variable_set(text *package_name, text *var_name,
 	Variable   *variable;
 	ScalarVar  *scalar;
 
-	package = createPackage(package_name, is_transactional);
-	variable = createVariableInternal(package, var_name, typid, false,
-									  is_transactional);
+	if (!cachedPackageMatches(package_name, is_transactional, true))
+	{
+		package = createPackage(package_name, is_transactional);
+		LastPackage = package;
+		LastVariable = NULL;
+	}
+	else
+		package = LastPackage;
+
+	if (!cachedVariableMatches(var_name, package) ||
+		LastVariable->typid != typid ||
+		LastVariable->is_record ||
+		LastVariable->is_transactional != is_transactional)
+	{
+		variable = createVariableInternal(package, var_name, typid, false,
+										  is_transactional);
+		LastVariable = variable;
+	}
+	else
+	{
+		variable = LastVariable;
+
+		if (variable->is_transactional &&
+			!isObjectChangedInCurrentTrans(&variable->transObject))
+		{
+			createSavepoint(&variable->transObject, TRANS_VARIABLE);
+			addToChangesStack(&variable->transObject, TRANS_VARIABLE);
+		}
+	}
 
 	scalar = &(GetActualValue(variable).scalar);
 
@@ -687,14 +790,14 @@ variable_get(text *package_name, text *var_name,
 	Variable   *variable;
 	ScalarVar  *scalar;
 
-	package = getPackage(package_name, strict);
+	package = getCachedPackage(package_name, strict);
 	if (package == NULL)
 	{
 		*is_null = true;
 		return 0;
 	}
 
-	variable = getVariableInternal(package, var_name, typid, false, strict);
+	variable = getCachedVariable(package, var_name, typid, false, strict);
 
 	if (variable == NULL)
 	{
@@ -824,11 +927,7 @@ variable_insert(PG_FUNCTION_ARGS)
 	is_transactional = PG_GETARG_BOOL(3);
 
 	/* Get cached package */
-	if (LastPackage == NULL ||
-		VARSIZE_ANY_EXHDR(package_name) != strlen(GetName(LastPackage)) ||
-		strncmp(VARDATA_ANY(package_name), GetName(LastPackage),
-				VARSIZE_ANY_EXHDR(package_name)) != 0 ||
-		!pack_htab(LastPackage, is_transactional))
+	if (!cachedPackageMatches(package_name, is_transactional, true))
 	{
 		package = createPackage(package_name, is_transactional);
 		LastPackage = package;
@@ -838,10 +937,10 @@ variable_insert(PG_FUNCTION_ARGS)
 		package = LastPackage;
 
 	/* Get cached variable */
-	if (LastVariable == NULL ||
-		VARSIZE_ANY_EXHDR(var_name) != strlen(GetName(LastVariable)) ||
-		strncmp(VARDATA_ANY(var_name), GetName(LastVariable),
-				VARSIZE_ANY_EXHDR(var_name)) != 0)
+	if (!cachedVariableMatches(var_name, package) ||
+		LastVariable->typid != RECORDOID ||
+		!LastVariable->is_record ||
+		LastVariable->is_transactional != is_transactional)
 	{
 		variable = createVariableInternal(package, var_name, RECORDOID,
 										  true, is_transactional);
@@ -850,17 +949,6 @@ variable_insert(PG_FUNCTION_ARGS)
 	else
 	{
 		TransObject *transObj;
-
-		if (LastVariable->is_transactional != is_transactional)
-		{
-			char		key[NAMEDATALEN];
-
-			getKeyFromName(var_name, key);
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("variable \"%s\" already created as %sTRANSACTIONAL",
-							key, LastVariable->is_transactional ? "" : "NOT ")));
-		}
 
 		variable = LastVariable;
 		transObj = &variable->transObject;
@@ -954,30 +1042,10 @@ variable_update(PG_FUNCTION_ARGS)
 	rec = PG_GETARG_HEAPTUPLEHEADER(2);
 
 	/* Get cached package */
-	if (LastPackage == NULL ||
-		VARSIZE_ANY_EXHDR(package_name) != strlen(GetName(LastPackage)) ||
-		strncmp(VARDATA_ANY(package_name), GetName(LastPackage),
-				VARSIZE_ANY_EXHDR(package_name)) != 0)
-	{
-		package = getPackage(package_name, true);
-		LastPackage = package;
-		LastVariable = NULL;
-	}
-	else
-		package = LastPackage;
+	package = getCachedPackage(package_name, true);
 
 	/* Get cached variable */
-	if (LastVariable == NULL ||
-		VARSIZE_ANY_EXHDR(var_name) != strlen(GetName(LastVariable)) ||
-		strncmp(VARDATA_ANY(var_name), GetName(LastVariable),
-				VARSIZE_ANY_EXHDR(var_name)) != 0)
-	{
-		variable = getVariableInternal(package, var_name, RECORDOID, true,
-									   true);
-		LastVariable = variable;
-	}
-	else
-		variable = LastVariable;
+	variable = getCachedVariable(package, var_name, RECORDOID, true, true);
 
 	transObject = &variable->transObject;
 	if (variable->is_transactional &&
@@ -1039,30 +1107,10 @@ variable_delete(PG_FUNCTION_ARGS)
 	}
 
 	/* Get cached package */
-	if (LastPackage == NULL ||
-		VARSIZE_ANY_EXHDR(package_name) != strlen(GetName(LastPackage)) ||
-		strncmp(VARDATA_ANY(package_name), GetName(LastPackage),
-				VARSIZE_ANY_EXHDR(package_name)) != 0)
-	{
-		package = getPackage(package_name, true);
-		LastPackage = package;
-		LastVariable = NULL;
-	}
-	else
-		package = LastPackage;
+	package = getCachedPackage(package_name, true);
 
 	/* Get cached variable */
-	if (LastVariable == NULL ||
-		VARSIZE_ANY_EXHDR(var_name) != strlen(GetName(LastVariable)) ||
-		strncmp(VARDATA_ANY(var_name), GetName(LastVariable),
-				VARSIZE_ANY_EXHDR(var_name)) != 0)
-	{
-		variable = getVariableInternal(package, var_name, RECORDOID, true,
-									   true);
-		LastVariable = variable;
-	}
-	else
-		variable = LastVariable;
+	variable = getCachedVariable(package, var_name, RECORDOID, true, true);
 
 	transObject = &variable->transObject;
 	if (variable->is_transactional &&
@@ -1108,9 +1156,9 @@ variable_select(PG_FUNCTION_ARGS)
 		package_name = PG_GETARG_TEXT_PP(0);
 		var_name = PG_GETARG_TEXT_PP(1);
 
-		package = getPackage(package_name, true);
-		variable = getVariableInternal(package, var_name, RECORDOID, true,
-									   true);
+		package = getCachedPackage(package_name, true);
+		variable = getCachedVariable(package, var_name, RECORDOID, true,
+									 true);
 		record = &(GetActualValue(variable).record);
 		funcctx = SRF_FIRSTCALL_INIT();
 
@@ -1208,8 +1256,8 @@ variable_select_by_value(PG_FUNCTION_ARGS)
 		value = 0;
 	}
 
-	package = getPackage(package_name, true);
-	variable = getVariableInternal(package, var_name, RECORDOID, true, true);
+	package = getCachedPackage(package_name, true);
+	variable = getCachedVariable(package, var_name, RECORDOID, true, true);
 
 	if (!value_is_null)
 		check_record_key(variable, value_type);
@@ -1242,7 +1290,7 @@ variable_select_by_value(PG_FUNCTION_ARGS)
 /* Structure for variable_select_by_values() */
 typedef struct
 {
-	Variable   *variable;
+	RecordVar  *record;
 	ArrayIterator iterator;
 }			VariableIteratorRec;
 
@@ -1263,7 +1311,10 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		ArrayType  *values;
 		Package    *package;
 		Variable   *variable;
+		RecordVar  *record;
+		VariableStatEntry *entry;
 		MemoryContext oldcontext;
+		MemoryContext listcontext;
 
 		/* Checks */
 		CHECK_ARGS_FOR_NULL();
@@ -1283,22 +1334,43 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		package_name = PG_GETARG_TEXT_PP(0);
 		var_name = PG_GETARG_TEXT_PP(1);
 
-		package = getPackage(package_name, true);
-		variable = getVariableInternal(package, var_name, RECORDOID, true,
-									   true);
+		package = getCachedPackage(package_name, true);
+		variable = getCachedVariable(package, var_name, RECORDOID, true,
+									 true);
+		record = &(GetActualValue(variable).record);
 
 		check_record_key(variable, ARR_ELEMTYPE(arg_values));
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		funcctx->tuple_desc = GetActualValue(variable).record.tupdesc;
+		funcctx->tuple_desc = record->tupdesc;
 
 		values = PG_GETARG_ARRAYTYPE_P_COPY(2);
 		var = (VariableIteratorRec *) palloc(sizeof(VariableIteratorRec));
 		var->iterator = array_create_iterator(values, 0, NULL);
-		var->variable = variable;
+		var->record = record;
 		funcctx->user_fctx = var;
+
+		entry = palloc0(sizeof(VariableStatEntry));
+		entry->hash = record->rhash;
+		entry->status = NULL;
+		entry->variable = variable;
+		entry->package = package;
+		entry->levels.level = GetCurrentTransactionNestLevel();
+#ifdef PGPRO_EE
+		entry->levels.atxlevel = getNestLevelATX();
+#endif
+		entry->user_fctx = &funcctx->user_fctx;
+		entry->active = true;
+		entry->callback.func = variableStatEntryShutdown;
+		entry->callback.arg = entry;
+		MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
+										   &entry->callback);
+
+		listcontext = MemoryContextSwitchTo(TopTransactionContext);
+		variables_stats = lcons((void *) entry, variables_stats);
+		MemoryContextSwitchTo(listcontext);
 
 		MemoryContextSwitchTo(oldcontext);
 		PG_FREE_IF_COPY(arg_values, 2);
@@ -1307,6 +1379,9 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
+	if (funcctx->user_fctx == NULL)
+		SRF_RETURN_DONE(funcctx);
+
 	var = (VariableIteratorRec *) funcctx->user_fctx;
 
 	/* Get next array element */
@@ -1316,7 +1391,7 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		bool		found;
 		RecordVar  *record;
 
-		record = &(GetActualValue(var->variable).record);
+		record = var->record;
 		/* Search a record */
 		k.value = value;
 		k.is_null = isnull;
@@ -1350,19 +1425,29 @@ variable_exists(PG_FUNCTION_ARGS)
 	Variable   *variable = NULL;
 	char		key[NAMEDATALEN];
 	bool		found = false;
+	bool		res = false;
 
 	CHECK_ARGS_FOR_NULL();
 
 	package_name = PG_GETARG_TEXT_PP(0);
 	var_name = PG_GETARG_TEXT_PP(1);
 
-	package = getPackage(package_name, false);
+	package = getCachedPackage(package_name, false);
+
 	if (package == NULL)
 	{
 		PG_FREE_IF_COPY(package_name, 0);
 		PG_FREE_IF_COPY(var_name, 1);
 
 		PG_RETURN_BOOL(false);
+	}
+
+	if (cachedVariableMatches(var_name, package))
+	{
+		PG_FREE_IF_COPY(package_name, 0);
+		PG_FREE_IF_COPY(var_name, 1);
+
+		PG_RETURN_BOOL(true);
 	}
 
 	getKeyFromName(var_name, key);
@@ -1374,10 +1459,17 @@ variable_exists(PG_FUNCTION_ARGS)
 		variable = (Variable *) hash_search(package->varHashTransact,
 											key, HASH_FIND, &found);
 
+	if (found && GetActualState(variable)->is_valid)
+	{
+		LastPackage = package;
+		LastVariable = variable;
+		res = true;
+	}
+
 	PG_FREE_IF_COPY(package_name, 0);
 	PG_FREE_IF_COPY(var_name, 1);
 
-	PG_RETURN_BOOL(variable ? GetActualState(variable)->is_valid : false);
+	PG_RETURN_BOOL(res);
 }
 
 /*
@@ -1396,7 +1488,7 @@ package_exists(PG_FUNCTION_ARGS)
 
 	package_name = PG_GETARG_TEXT_PP(0);
 
-	res = getPackage(package_name, false) != NULL;
+	res = getCachedPackage(package_name, false) != NULL;
 
 	PG_FREE_IF_COPY(package_name, 0);
 	PG_RETURN_BOOL(res);
@@ -1419,8 +1511,8 @@ remove_variable(PG_FUNCTION_ARGS)
 	package_name = PG_GETARG_TEXT_PP(0);
 	var_name = PG_GETARG_TEXT_PP(1);
 
-	package = getPackage(package_name, true);
-	variable = getVariableInternal(package, var_name, InvalidOid, false, true);
+	package = getCachedPackage(package_name, true);
+	variable = getCachedVariable(package, var_name, InvalidOid, false, true);
 
 	/* Add package to changes list, so we can remove it if it is empty */
 	if (!isObjectChangedInCurrentTrans(&package->transObject))
@@ -1596,8 +1688,8 @@ remove_packages(PG_FUNCTION_ARGS)
  */
 typedef struct
 {
-	char	   *package;
-	char	   *variable;
+	char		package[NAMEDATALEN];
+	char		variable[NAMEDATALEN];
 	bool		is_transactional;
 }			VariableRec;
 
@@ -1638,7 +1730,7 @@ get_packages_and_variables(PG_FUNCTION_ARGS)
 			int			mRecs = NUMVARIABLES,
 						nRecs = 0;
 
-			recs = (VariableRec *) palloc0(sizeof(VariableRec) * mRecs);
+			recs = (VariableRec *) palloc(sizeof(VariableRec) * mRecs);
 
 			/* Get packages list */
 			hash_seq_init(&pstat, packagesHash);
@@ -1674,8 +1766,10 @@ get_packages_and_variables(PG_FUNCTION_ARGS)
 															sizeof(VariableRec) * mRecs);
 						}
 
-						recs[nRecs].package = GetName(package);
-						recs[nRecs].variable = GetName(variable);
+						strlcpy(recs[nRecs].package, GetName(package),
+								NAMEDATALEN);
+						strlcpy(recs[nRecs].variable, GetName(variable),
+								NAMEDATALEN);
 						recs[nRecs].is_transactional = variable->is_transactional;
 						nRecs++;
 					}
@@ -1706,16 +1800,12 @@ get_packages_and_variables(PG_FUNCTION_ARGS)
 
 		memset(nulls, 0, sizeof(nulls));
 
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
 		values[0] = PointerGetDatum(cstring_to_text(recs[i].package));
 		values[1] = PointerGetDatum(cstring_to_text(recs[i].variable));
 		values[2] = recs[i].is_transactional;
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		result = HeapTupleGetDatum(tuple);
-
-		MemoryContextSwitchTo(oldcontext);
 
 		SRF_RETURN_NEXT(funcctx, result);
 	}
@@ -2811,6 +2901,7 @@ processChanges(Action action, bool sub)
 
 	applyAction(action, TRANS_VARIABLE, bottom_list->changedVarsList, sub);
 	applyAction(action, TRANS_PACKAGE, bottom_list->changedPacksList, sub);
+	resetVariablesCache();
 
 	/* Remove changes list of current level */
 	MemoryContextDelete(bottom_list->ctx);
@@ -3183,11 +3274,14 @@ freeStatsLists(void)
 		if (!entry->active)
 			continue;
 
+		if (entry->status)
+		{
 #ifdef PGPRO_EE
-		hash_seq_term_all_levels(entry->status);
+			hash_seq_term_all_levels(entry->status);
 #else
-		hash_seq_term(entry->status);
+			hash_seq_term(entry->status);
 #endif
+		}
 		VariableStatEntry_clear_fctx(entry);
 		VariableStatEntry_deactivate(entry);
 	}
@@ -3201,11 +3295,14 @@ freeStatsLists(void)
 		if (!entry->active)
 			continue;
 
+		if (entry->status)
+		{
 #ifdef PGPRO_EE
-		hash_seq_term_all_levels(entry->status);
+			hash_seq_term_all_levels(entry->status);
 #else
-		hash_seq_term(entry->status);
+			hash_seq_term(entry->status);
 #endif
+		}
 		PackageStatEntry_clear_fctx(entry);
 		PackageStatEntry_deactivate(entry);
 	}

@@ -4,6 +4,23 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Cache hits must not bypass record/scalar type validation.
+SELECT pgv_set('cache', 'same', 1::int);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_insert('cache', 'same', ROW (1::int), FALSE); -- fail
+ERROR:  variable "same" requires "integer" value
+SELECT pgv_select('cache', 'same'); -- fail
+ERROR:  variable "same" requires "integer" value
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
 -- A by-reference scalar value returned by pgv_get() must not alias the
 -- stored value that can be replaced later in the same statement.
 SELECT pgv_set('lifetime', 'textval', 'aaaaaaaa'::text);
@@ -96,6 +113,46 @@ ORDER BY id;
   2 | two
 (2 rows)
 
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Active pgv_select(package, name, anyarray) cursors must be invalidated
+-- before the underlying record variable can be freed by pgv_free().
+SELECT pgv_insert('lifetime', 'rec', ROW (1::int, 'one'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('lifetime', 'rec', ROW (2::int, 'two'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+BEGIN;
+DECLARE array_cur CURSOR FOR SELECT pgv_select('lifetime', 'rec', ARRAY[1, 2]);
+FETCH 1 FROM array_cur;
+ pgv_select 
+------------
+ (1,one)
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+FETCH ALL FROM array_cur;
+ pgv_select 
+------------
+(0 rows)
+
+COMMIT;
 SELECT pgv_free();
  pgv_free 
 ----------
