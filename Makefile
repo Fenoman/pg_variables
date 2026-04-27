@@ -10,7 +10,7 @@ DATA_built = $(EXTENSION)--$(EXTVERSION).sql
 
 PGFILEDESC = "pg_variables - sessional variables"
 
-REGRESS = pg_variables pg_variables_any pg_variables_trans pg_variables_atx \
+REGRESS = pg_variables pg_variables_any pg_variables_lifetime pg_variables_trans pg_variables_atx \
 		pg_variables_atx_pkg
 
 ifdef USE_PGXS

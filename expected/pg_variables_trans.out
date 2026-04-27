@@ -2930,7 +2930,10 @@ SELECT pgv_remove('test', 'x');
 (1 row)
 
 FETCH 1 in r1_cur;
-ERROR:  unrecognized package "test"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 SELECT pgv_select('test', 'x');
  pgv_select 
@@ -2953,7 +2956,10 @@ SELECT pgv_remove('test');
 (1 row)
 
 FETCH 1 in r1_cur;
-ERROR:  unrecognized package "test"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 SELECT pgv_select('test', 'x');
  pgv_select 
@@ -2976,7 +2982,10 @@ SELECT pgv_free();
 (1 row)
 
 FETCH 1 in r1_cur;
-ERROR:  unrecognized package "test"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 SELECT pgv_select('test', 'x');
  pgv_select 
@@ -3406,7 +3415,10 @@ SELECT pgv_remove('test', 'z1');
 (1 row)
 
 FETCH 1 in r1_cur;
-ERROR:  unrecognized variable "z1"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 SELECT pgv_select('test', 'z1');
  pgv_select 

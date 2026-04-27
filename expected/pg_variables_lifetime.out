@@ -1,0 +1,138 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- A by-reference scalar value returned by pgv_get() must not alias the
+-- stored value that can be replaced later in the same statement.
+SELECT pgv_set('lifetime', 'textval', 'aaaaaaaa'::text);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('lifetime', 'textval', NULL::text) AS before_set,
+       pgv_set('lifetime', 'textval', 'bbbbbbbb'::text) AS set_again;
+ before_set | set_again 
+------------+-----------
+ aaaaaaaa   | 
+(1 row)
+
+SELECT pgv_get('lifetime', 'textval', NULL::text) AS after_set;
+ after_set 
+-----------
+ bbbbbbbb
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Re-creating a transactional record variable after pgv_remove(package)
+-- must discard the old record hash context instead of accumulating it.
+BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int), TRUE);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+CREATE TEMP TABLE pgv_lifetime_stats(before_remove bigint);
+INSERT INTO pgv_lifetime_stats
+SELECT allocated_memory FROM pgv_stats() WHERE package = 'test';
+SELECT pgv_remove('test');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('test', 'x', ROW (1::int), TRUE);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_exists('test') AS package_exists,
+       pgv_exists('test', 'x') AS variable_exists,
+       (SELECT count(*) FROM pgv_select('test', 'x') AS t(id int)) AS rows_after_reinsert,
+       (SELECT allocated_memory FROM pgv_stats() WHERE package = 'test') <=
+       (SELECT before_remove FROM pgv_lifetime_stats) AS record_context_reused;
+ package_exists | variable_exists | rows_after_reinsert | record_context_reused 
+----------------+-----------------+---------------------+-----------------------
+ t              | t               |                   1 | t
+(1 row)
+
+COMMIT;
+DROP TABLE pgv_lifetime_stats;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Keep an expression-built array argument alive for all calls of
+-- pgv_select(package, name, anyarray).
+SELECT pgv_insert('lifetime', 'rec', ROW (1::int, 'one'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('lifetime', 'rec', ROW (2::int, 'two'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT * FROM pgv_select('lifetime', 'rec',
+                         ARRAY(SELECT generate_series(1, 2))) AS t(id int, label text)
+ORDER BY id;
+ id | label 
+----+-------
+  1 | one
+  2 | two
+(2 rows)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Active pgv_stats cursors must be invalidated before packagesHash can be
+-- freed by pgv_free().
+SELECT pgv_set('stats', 'a', '1'::text);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+DECLARE stats_cur CURSOR FOR SELECT package FROM pgv_stats();
+FETCH 1 FROM stats_cur;
+ package 
+---------
+ stats
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+FETCH 1 FROM stats_cur;
+ package 
+---------
+(0 rows)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
