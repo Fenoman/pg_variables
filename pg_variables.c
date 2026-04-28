@@ -56,6 +56,7 @@ static inline bool textNameEquals(text *name, const char *key);
 static inline bool cachedPackageMatches(text *name, bool is_trans,
 										bool require_htab);
 static inline bool cachedVariableMatches(text *name, Package *package);
+static inline Oid getCachedArgType(FunctionCallInfo fcinfo, int argnum);
 static Package *getCachedPackage(text *name, bool strict);
 static Variable *getCachedVariable(Package *package, text *name,
 									Oid typid, bool is_record, bool strict);
@@ -696,6 +697,22 @@ cachedVariableMatches(text *name, Package *package)
 		GetActualState(LastVariable)->is_valid;
 }
 
+static inline Oid
+getCachedArgType(FunctionCallInfo fcinfo, int argnum)
+{
+	Oid		   *typid = (Oid *) fcinfo->flinfo->fn_extra;
+
+	if (typid == NULL)
+	{
+		typid = (Oid *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+										   sizeof(Oid));
+		*typid = get_fn_expr_argtype(fcinfo->flinfo, argnum);
+		fcinfo->flinfo->fn_extra = typid;
+	}
+
+	return *typid;
+}
+
 static Package *
 getCachedPackage(text *name, bool strict)
 {
@@ -890,8 +907,8 @@ VARIABLE_GET_TEMPLATE(0, 1, 2, date, DATEOID)
 VARIABLE_GET_TEMPLATE(0, 1, 2, jsonb, JSONBOID)
 
 /* current API */
-VARIABLE_GET_TEMPLATE(0, 1, 3, any, get_fn_expr_argtype(fcinfo->flinfo, 2))
-VARIABLE_GET_TEMPLATE(0, 1, 3, array, get_fn_expr_argtype(fcinfo->flinfo, 2))
+VARIABLE_GET_TEMPLATE(0, 1, 3, any, getCachedArgType(fcinfo, 2))
+VARIABLE_GET_TEMPLATE(0, 1, 3, array, getCachedArgType(fcinfo, 2))
 
 
 #define VARIABLE_SET_TEMPLATE(type, typid) \
@@ -929,8 +946,8 @@ VARIABLE_SET_TEMPLATE(date, DATEOID)
 VARIABLE_SET_TEMPLATE(jsonb, JSONBOID)
 
 /* current API */
-VARIABLE_SET_TEMPLATE(any, get_fn_expr_argtype(fcinfo->flinfo, 2))
-VARIABLE_SET_TEMPLATE(array, get_fn_expr_argtype(fcinfo->flinfo, 2))
+VARIABLE_SET_TEMPLATE(any, getCachedArgType(fcinfo, 2))
+VARIABLE_SET_TEMPLATE(array, getCachedArgType(fcinfo, 2))
 
 
 Datum
@@ -1134,7 +1151,7 @@ variable_delete(PG_FUNCTION_ARGS)
 
 	if (!value_is_null)
 	{
-		value_type = get_fn_expr_argtype(fcinfo->flinfo, 2);
+		value_type = getCachedArgType(fcinfo, 2);
 		value = PG_GETARG_DATUM(2);
 	}
 	else
@@ -1285,7 +1302,7 @@ variable_select_by_value(PG_FUNCTION_ARGS)
 
 	if (!value_is_null)
 	{
-		value_type = get_fn_expr_argtype(fcinfo->flinfo, 2);
+		value_type = getCachedArgType(fcinfo, 2);
 		value = PG_GETARG_DATUM(2);
 	}
 	else
