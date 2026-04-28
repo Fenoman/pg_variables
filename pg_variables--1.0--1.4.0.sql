@@ -5,44 +5,188 @@
 
 SET LOCAL client_min_messages = warning;
 
--- Recreate all SQL objects when upgrading to 1.4.0.
+-- Update surviving SQL objects in place and remove obsolete objects.
+
+-- Version 1.0 exposed pgv_list() with a different result row type.
+DROP FUNCTION IF EXISTS pgv_list();
+
+-- Scalar variables functions
+
+CREATE OR REPLACE FUNCTION pgv_set(package text, name text, value anynonarray, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_any'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get(package text, name text, var_type anynonarray, strict bool default true)
+RETURNS anynonarray
+AS 'MODULE_PATHNAME', 'variable_get_any'
+LANGUAGE C VOLATILE;
+
+-- Functions to work with arrays
+
+CREATE OR REPLACE FUNCTION pgv_set(package text, name text, value anyarray, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_array'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get(package text, name text, var_type anyarray, strict bool default true)
+RETURNS anyarray
+AS 'MODULE_PATHNAME', 'variable_get_array'
+LANGUAGE C VOLATILE;
+
+-- Deprecated scalar variables functions
+
+CREATE OR REPLACE FUNCTION pgv_set_int(package text, name text, value int, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_int'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_int(package text, name text, strict bool default true)
+RETURNS int
+AS 'MODULE_PATHNAME', 'variable_get_int'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_text(package text, name text, value text, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_text'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_text(package text, name text, strict bool default true)
+RETURNS text
+AS 'MODULE_PATHNAME', 'variable_get_text'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_numeric(package text, name text, value numeric, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_numeric'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_numeric(package text, name text, strict bool default true)
+RETURNS numeric
+AS 'MODULE_PATHNAME', 'variable_get_numeric'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_timestamp(package text, name text, value timestamp, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_timestamp'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_timestamp(package text, name text, strict bool default true)
+RETURNS timestamp
+AS 'MODULE_PATHNAME', 'variable_get_timestamp'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_timestamptz(package text, name text, value timestamptz, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_timestamptz'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_timestamptz(package text, name text, strict bool default true)
+RETURNS timestamptz
+AS 'MODULE_PATHNAME', 'variable_get_timestamptz'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_date(package text, name text, value date, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_date'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_date(package text, name text, strict bool default true)
+RETURNS date
+AS 'MODULE_PATHNAME', 'variable_get_date'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_set_jsonb(package text, name text, value jsonb, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_set_jsonb'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_get_jsonb(package text, name text, strict bool default true)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'variable_get_jsonb'
+LANGUAGE C VOLATILE;
+
+-- Functions to work with records
+
+CREATE OR REPLACE FUNCTION pgv_insert(package text, name text, r record, is_transactional bool default false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'variable_insert'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_update(package text, name text, r record)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'variable_update'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_delete(package text, name text, value anynonarray)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'variable_delete'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_select(package text, name text)
+RETURNS setof record
+AS 'MODULE_PATHNAME', 'variable_select'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_select(package text, name text, value anynonarray)
+RETURNS record
+AS 'MODULE_PATHNAME', 'variable_select_by_value'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_select(package text, name text, value anyarray)
+RETURNS setof record
+AS 'MODULE_PATHNAME', 'variable_select_by_values'
+LANGUAGE C VOLATILE;
+
+-- Functions to work with packages
+
+CREATE OR REPLACE FUNCTION pgv_exists(package text, name text)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'variable_exists'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_exists(package text)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'package_exists'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_remove(package text, name text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'remove_variable'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_remove(package text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'remove_package'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_free()
+RETURNS void
+AS 'MODULE_PATHNAME', 'remove_packages'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_list()
+RETURNS TABLE(package text, name text, is_transactional bool)
+AS 'MODULE_PATHNAME', 'get_packages_and_variables'
+LANGUAGE C VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgv_stats()
+RETURNS TABLE(package text, allocated_memory bigint)
+AS 'MODULE_PATHNAME', 'get_packages_stats'
+LANGUAGE C VOLATILE;
+
+-- Obsolete functions removed from the 1.4.0 API.
 
 DROP FUNCTION IF EXISTS pgv_set(package text, name text, value anynonarray);
-DROP FUNCTION IF EXISTS pgv_set(package text, name text, value anynonarray, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_set(package text, name text, value anyarray, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get(package text, name text, var_type anynonarray, strict bool);
-DROP FUNCTION IF EXISTS pgv_get(package text, name text, var_type anyarray, strict bool);
-
 DROP FUNCTION IF EXISTS pgv_set_int(package text, name text, value int);
-DROP FUNCTION IF EXISTS pgv_set_int(package text, name text, value int, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_int(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_text(package text, name text, value text);
-DROP FUNCTION IF EXISTS pgv_set_text(package text, name text, value text, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_text(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_numeric(package text, name text, value numeric);
-DROP FUNCTION IF EXISTS pgv_set_numeric(package text, name text, value numeric, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_numeric(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_timestamp(package text, name text, value timestamp);
-DROP FUNCTION IF EXISTS pgv_set_timestamp(package text, name text, value timestamp, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_timestamp(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_timestamptz(package text, name text, value timestamptz);
-DROP FUNCTION IF EXISTS pgv_set_timestamptz(package text, name text, value timestamptz, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_timestamptz(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_date(package text, name text, value date);
-DROP FUNCTION IF EXISTS pgv_set_date(package text, name text, value date, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_date(package text, name text, strict bool);
 DROP FUNCTION IF EXISTS pgv_set_jsonb(package text, name text, value jsonb);
-DROP FUNCTION IF EXISTS pgv_set_jsonb(package text, name text, value jsonb, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_get_jsonb(package text, name text, strict bool);
-
 DROP FUNCTION IF EXISTS pgv_insert(package text, name text, r record);
-DROP FUNCTION IF EXISTS pgv_insert(package text, name text, r record, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_update(package text, name text, r record);
-DROP FUNCTION IF EXISTS pgv_delete(package text, name text, value anynonarray);
 DROP FUNCTION IF EXISTS pgv_count(package text, name text);
-DROP FUNCTION IF EXISTS pgv_select(package text, name text);
-DROP FUNCTION IF EXISTS pgv_select(package text, name text, value anynonarray);
-DROP FUNCTION IF EXISTS pgv_select(package text, name text, value anyarray);
 DROP FUNCTION IF EXISTS pgv_select_support(internal);
 DROP FUNCTION IF EXISTS pgv_first(package text, name text, value anyelement);
 DROP FUNCTION IF EXISTS pgv_last(package text, name text, value anyelement);
@@ -56,176 +200,3 @@ DROP FUNCTION IF EXISTS pgv_exists_elem(package text, name text, value integer);
 DROP FUNCTION IF EXISTS pgv_exists_elem(package text, name text, value text);
 DROP FUNCTION IF EXISTS pgv_remove_elem(package text, name text, value integer);
 DROP FUNCTION IF EXISTS pgv_remove_elem(package text, name text, value text);
-
-DROP FUNCTION IF EXISTS pgv_exists(package text, name text);
-DROP FUNCTION IF EXISTS pgv_exists(package text);
-DROP FUNCTION IF EXISTS pgv_remove(package text, name text);
-DROP FUNCTION IF EXISTS pgv_remove(package text);
-DROP FUNCTION IF EXISTS pgv_free();
-DROP FUNCTION IF EXISTS pgv_list();
-DROP FUNCTION IF EXISTS pgv_stats();
-
--- Scalar variables functions
-
-CREATE FUNCTION pgv_set(package text, name text, value anynonarray, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_any'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get(package text, name text, var_type anynonarray, strict bool default true)
-RETURNS anynonarray
-AS 'MODULE_PATHNAME', 'variable_get_any'
-LANGUAGE C VOLATILE;
-
--- Functions to work with arrays
-
-CREATE FUNCTION pgv_set(package text, name text, value anyarray, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_array'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get(package text, name text, var_type anyarray, strict bool default true)
-RETURNS anyarray
-AS 'MODULE_PATHNAME', 'variable_get_array'
-LANGUAGE C VOLATILE;
-
--- Deprecated scalar variables functions
-
-CREATE FUNCTION pgv_set_int(package text, name text, value int, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_int'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_int(package text, name text, strict bool default true)
-RETURNS int
-AS 'MODULE_PATHNAME', 'variable_get_int'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_text(package text, name text, value text, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_text'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_text(package text, name text, strict bool default true)
-RETURNS text
-AS 'MODULE_PATHNAME', 'variable_get_text'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_numeric(package text, name text, value numeric, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_numeric'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_numeric(package text, name text, strict bool default true)
-RETURNS numeric
-AS 'MODULE_PATHNAME', 'variable_get_numeric'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_timestamp(package text, name text, value timestamp, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_timestamp'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_timestamp(package text, name text, strict bool default true)
-RETURNS timestamp
-AS 'MODULE_PATHNAME', 'variable_get_timestamp'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_timestamptz(package text, name text, value timestamptz, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_timestamptz'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_timestamptz(package text, name text, strict bool default true)
-RETURNS timestamptz
-AS 'MODULE_PATHNAME', 'variable_get_timestamptz'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_date(package text, name text, value date, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_date'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_date(package text, name text, strict bool default true)
-RETURNS date
-AS 'MODULE_PATHNAME', 'variable_get_date'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_set_jsonb(package text, name text, value jsonb, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_set_jsonb'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_get_jsonb(package text, name text, strict bool default true)
-RETURNS jsonb
-AS 'MODULE_PATHNAME', 'variable_get_jsonb'
-LANGUAGE C VOLATILE;
-
--- Functions to work with records
-
-CREATE FUNCTION pgv_insert(package text, name text, r record, is_transactional bool default false)
-RETURNS void
-AS 'MODULE_PATHNAME', 'variable_insert'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_update(package text, name text, r record)
-RETURNS boolean
-AS 'MODULE_PATHNAME', 'variable_update'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_delete(package text, name text, value anynonarray)
-RETURNS boolean
-AS 'MODULE_PATHNAME', 'variable_delete'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_select(package text, name text)
-RETURNS setof record
-AS 'MODULE_PATHNAME', 'variable_select'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_select(package text, name text, value anynonarray)
-RETURNS record
-AS 'MODULE_PATHNAME', 'variable_select_by_value'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_select(package text, name text, value anyarray)
-RETURNS setof record
-AS 'MODULE_PATHNAME', 'variable_select_by_values'
-LANGUAGE C VOLATILE;
-
--- Functions to work with packages
-
-CREATE FUNCTION pgv_exists(package text, name text)
-RETURNS bool
-AS 'MODULE_PATHNAME', 'variable_exists'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_exists(package text)
-RETURNS bool
-AS 'MODULE_PATHNAME', 'package_exists'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_remove(package text, name text)
-RETURNS void
-AS 'MODULE_PATHNAME', 'remove_variable'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_remove(package text)
-RETURNS void
-AS 'MODULE_PATHNAME', 'remove_package'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_free()
-RETURNS void
-AS 'MODULE_PATHNAME', 'remove_packages'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_list()
-RETURNS TABLE(package text, name text, is_transactional bool)
-AS 'MODULE_PATHNAME', 'get_packages_and_variables'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION pgv_stats()
-RETURNS TABLE(package text, allocated_memory bigint)
-AS 'MODULE_PATHNAME', 'get_packages_stats'
-LANGUAGE C VOLATILE;

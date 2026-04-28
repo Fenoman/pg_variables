@@ -67,6 +67,15 @@ BEGIN
 END$$;
 UPDATE pg_extension SET extversion = '1.3' WHERE extname = 'pg_variables';
 SELECT extversion AS installed_version FROM pg_extension WHERE extname = 'pg_variables';
+CREATE FUNCTION upgrade_dep_get()
+RETURNS integer
+LANGUAGE sql
+AS $$SELECT pgv_get_int('upgrade_13', 'v', false)$$;
+CREATE VIEW upgrade_dep_select AS
+SELECT * FROM pgv_select('upgrade_13', 'r') AS t(id int, val text);
+CREATE VIEW upgrade_dep_exists AS
+SELECT pgv_exists('upgrade_13') AS package_exists,
+       pgv_exists('upgrade_13', 'v') AS variable_exists;
 ALTER EXTENSION pg_variables UPDATE TO '1.4.0';
 SELECT extversion AS upgraded_version FROM pg_extension WHERE extname = 'pg_variables';
 SELECT count(*) AS old_pgpro_13_functions_left
@@ -78,7 +87,13 @@ WHERE n.nspname = 'public'
     'pgv_prior', 'pgv_get_elem', 'pgv_set_elem', 'pgv_remove_elem',
     'pgv_select_support'
   ]);
+SELECT pgv_set_int('upgrade_13', 'v', 13, true);
+SELECT upgrade_dep_get();
+SELECT * FROM upgrade_dep_exists;
 SELECT pgv_insert('upgrade_13', 'r', ROW(13::int, 'thirteen'::text), true);
-SELECT pgv_select('upgrade_13', 'r');
+SELECT * FROM upgrade_dep_select;
 SELECT pgv_free();
+DROP VIEW upgrade_dep_exists;
+DROP VIEW upgrade_dep_select;
+DROP FUNCTION upgrade_dep_get();
 DROP EXTENSION pg_variables;
