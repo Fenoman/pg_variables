@@ -42,6 +42,15 @@ You can aggregate variables into packages. This is done to be able to have
 variables with different names or to quickly remove the whole batch of
 variables. If the package becomes empty, it is automatically deleted.
 
+## Configuration
+
+`pg_variables.unlock_advisory_locks_on_abort` controls cleanup of session-level
+advisory locks on transaction abort. It is enabled by default. When enabled,
+the backend releases all session-level advisory locks on a top-level transaction
+abort or rollback, using the same lock manager path as
+`pg_advisory_unlock_all()`. `COMMIT` and `ROLLBACK TO SAVEPOINT` keep regular
+PostgreSQL behavior.
+
 ## License
 
 This module available under the [license](LICENSE) similar to
