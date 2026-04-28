@@ -1,5 +1,37 @@
 SELECT pgv_free();
 
+-- Transactional variables created inside an explicit transaction must not
+-- leak into the session after COMMIT.
+BEGIN;
+SELECT pgv_set('txlocal_scalar', 'v', 10::int, TRUE);
+COMMIT;
+SELECT pgv_get('txlocal_scalar', 'v', NULL::int);
+
+-- Non-transactional variables in the same package must keep the package alive,
+-- while transactional variables from that transaction disappear.
+BEGIN;
+SELECT pgv_set('txlocal_mixed', 'regular', 20::int, FALSE);
+SELECT pgv_set('txlocal_mixed', 'trans', 30::int, TRUE);
+COMMIT;
+SELECT pgv_get('txlocal_mixed', 'regular', NULL::int);
+SELECT pgv_get('txlocal_mixed', 'trans', NULL::int);
+SELECT pgv_free();
+
+-- A transactional variable that existed before the explicit transaction must
+-- be restored to its previous value after COMMIT.
+SELECT pgv_set('txlocal_existing', 'v', 1::int, TRUE);
+BEGIN;
+SELECT pgv_set('txlocal_existing', 'v', 2::int, TRUE);
+COMMIT;
+SELECT pgv_get('txlocal_existing', 'v', NULL::int);
+SELECT pgv_free();
+
+-- Transactional record variables follow the same transaction-local lifetime.
+BEGIN;
+SELECT pgv_insert('txlocal_record', 'r', ROW (1::int, 'one'::text), TRUE);
+COMMIT;
+SELECT * FROM pgv_select('txlocal_record', 'r') AS t(id int, label text);
+
 -- Cache hits must not bypass record/scalar type validation.
 SELECT pgv_set('cache', 'same', 1::int);
 SELECT pgv_insert('cache', 'same', ROW (1::int), FALSE); -- fail

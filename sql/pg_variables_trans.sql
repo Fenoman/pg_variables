@@ -96,6 +96,22 @@ SELECT pgv_select('vars3', 'r1');
 SELECT pgv_select('vars3', 'r2');
 COMMIT;
 
+-- Re-create transactional variables outside an explicit transaction.  The
+-- savepoint tests below still need persistent transactional variables as their
+-- starting point, while explicit-transaction TRUE changes are now discarded on
+-- COMMIT.
+SELECT pgv_set('vars', 'any1', 'another value'::text, true);
+SELECT pgv_set_int('vars', 'int1', 103, true);
+SELECT pgv_set_int('vars', 'intNULL', 104, true);
+SELECT pgv_set_text('vars', 'str1', 's103', true);
+SELECT pgv_set_numeric('vars', 'num1', 1.03, true);
+SELECT pgv_set_timestamp('vars', 'ts1', '2016-03-30 12:00:00', true);
+SELECT pgv_set_timestamptz('vars', 'tstz1', '2016-03-30 12:00:00 GMT+03', true);
+SELECT pgv_set_date('vars', 'd1', '2016-04-02', true);
+SELECT pgv_set_jsonb('vars2', 'j1', '{"foo": [true, "bar"], "tags": {"a": 1, "b": null}}', true);
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
+SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
+
 
 
 --CHECK SAVEPOINT ROLLBACK

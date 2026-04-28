@@ -75,6 +75,7 @@ typedef struct PackState
 {
 	TransState	state;
 	unsigned long trans_var_num;	/* Number of valid transactional variables */
+	bool		is_removed;		/* Package was explicitly removed */
 }			PackState;
 
 /* List node that stores one of the variable's states */

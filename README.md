@@ -315,7 +315,25 @@ SELECT pgv_free();
 
 If you want variables with support of transactions and savepoints, you should
 add flag `is_transactional = true` as the last argument in functions `pgv_set()`
-or `pgv_insert()`.
+or `pgv_insert()`.  Transactional variables created or changed in a standalone
+statement are stored in the session as before.  Transactional variables created
+or changed inside an explicit transaction block are transaction-local: at the
+top-level `COMMIT`, new variables disappear and changes to existing variables
+are reverted to the state that existed before `BEGIN`.  Non-transactional
+variables are not affected by this rule.
+
+Explicit `pgv_remove(package)` inside an explicit transaction block remains
+effective after `COMMIT`: the whole package is removed, including its
+non-transactional variables.  Removing a single transactional variable with
+`pgv_remove(package, name)` inside an explicit transaction block follows the
+transaction-local rule: after `COMMIT`, the variable is restored to the state
+that existed before `BEGIN`.
+
+PostgreSQL materializes holdable cursors before transaction end.  Therefore, a
+`DECLARE CURSOR WITH HOLD` query over transaction-local variables can still fetch
+the materialized in-transaction snapshot after `COMMIT`, even though subsequent
+`pgv_*` calls see the discarded or restored state.
+
 Following use cases describe behavior of transactional variables:
 
 ```sql

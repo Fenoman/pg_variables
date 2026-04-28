@@ -74,6 +74,7 @@ static void resetVariablesCache(void);
 static void createSavepoint(TransObject *object, TransObjectType type);
 static void releaseSavepoint(TransObject *object, TransObjectType type, bool sub);
 static void rollbackSavepoint(TransObject *object, TransObjectType type, bool sub);
+static void discardTransactionalSavepoint(TransObject *object);
 
 static void copyValue(VarState *src, VarState *dest, Variable *destVar);
 static void freeValue(VarState *varstate, bool is_record);
@@ -86,6 +87,7 @@ static void addToChangesStack(TransObject *object, TransObjectType type);
 static void addToChangesStackUpperLevel(TransObject *object,
 										TransObjectType type);
 static void pushChangesStack(void);
+static bool shouldDiscardTransactionalOnCommit(void);
 
 static int	numOfRegVars(Package *package);
 
@@ -1679,6 +1681,7 @@ removePackageInternal(Package *package)
 	}
 	GetActualState(package)->is_valid = false;
 	GetPackState(package)->trans_var_num = 0;
+	GetPackState(package)->is_removed = true;
 }
 
 /* Check if package has any valid variables */
@@ -2173,6 +2176,7 @@ createPackage(text *name, bool is_trans)
 			Variable   *variable;
 
 			GetActualState(package)->is_valid = true;
+			GetPackState(package)->is_removed = false;
 			/* Mark all transactional variables in package as removed */
 			if (package->varHashTransact)
 			{
@@ -2548,6 +2552,7 @@ createSavepoint(TransObject *object, TransObjectType type)
 		newState = (TransState *) MemoryContextAllocZero(ModuleContext,
 														 sizeof(PackState));
 		((PackState *) newState)->trans_var_num = ((PackState *) prevState)->trans_var_num;
+		((PackState *) newState)->is_removed = ((PackState *) prevState)->is_removed;
 	}
 	else
 	{
@@ -2650,6 +2655,69 @@ rollbackSavepoint(TransObject *object, TransObjectType type, bool sub)
 			((Variable *) object)->is_deleted =
 				!GetActualState(object)->is_valid;
 	}
+}
+
+/*
+ * Discard a transactional variable's current top-level transaction state on
+ * COMMIT of an explicit transaction block.  This makes TRUE variables act as a
+ * transaction-local overlay: creation disappears, updates revert to the
+ * previous state, and removals restore the previous state.
+ */
+static void
+discardTransactionalSavepoint(TransObject *object)
+{
+	Variable   *variable = (Variable *) object;
+	Package    *package = variable->package;
+	TransState *state;
+	bool		current_valid;
+	bool		restored_valid = false;
+
+	Assert(variable->is_transactional);
+
+	/* Nothing to do here if trans object was removed already. */
+	if (dlist_is_empty(&object->states))
+	{
+		removeObject(object, TRANS_VARIABLE);
+		return;
+	}
+
+	state = GetActualState(object);
+	Assert(state->levels.level == GetCurrentTransactionNestLevel());
+#ifdef PGPRO_EE
+	Assert(state->levels.atxlevel == getNestLevelATX());
+#endif
+
+	current_valid = state->is_valid;
+	if (dlist_has_next(&object->states, &state->node))
+	{
+		TransState *prev_state;
+
+		prev_state = dlist_container(TransState, node, state->node.next);
+		restored_valid = prev_state->is_valid;
+	}
+
+	removeState(object, TRANS_VARIABLE, state);
+
+	if (current_valid != restored_valid)
+	{
+		if (current_valid)
+		{
+			Assert(GetPackState(package)->trans_var_num > 0);
+			if (GetPackState(package)->trans_var_num > 0)
+				GetPackState(package)->trans_var_num--;
+		}
+		else
+			GetPackState(package)->trans_var_num++;
+	}
+
+	if (dlist_is_empty(&object->states))
+	{
+		removeObject(object, TRANS_VARIABLE);
+		return;
+	}
+
+	variable->is_deleted = !restored_valid;
+	GetActualState(&package->transObject)->is_valid = !isPackageEmpty(package);
 }
 
 /*
@@ -2906,7 +2974,8 @@ addToChangesStack(TransObject *object, TransObjectType type)
 typedef enum Action
 {
 	RELEASE_SAVEPOINT,
-	ROLLBACK_TO_SAVEPOINT
+	ROLLBACK_TO_SAVEPOINT,
+	DISCARD_TRANSACTIONAL_SAVEPOINT
 }			Action;
 
 /*
@@ -2928,6 +2997,7 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 				rollbackSavepoint(object, type, sub);
 				break;
 			case RELEASE_SAVEPOINT:
+			case DISCARD_TRANSACTIONAL_SAVEPOINT:
 
 				/*
 				 * If package was removed in current transaction level mark
@@ -2941,6 +3011,14 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 
 					if (!GetActualState(package)->is_valid)
 						GetActualState(variable)->is_valid = false;
+
+					if (action == DISCARD_TRANSACTIONAL_SAVEPOINT &&
+						variable->is_transactional &&
+						!GetPackState(package)->is_removed)
+					{
+						discardTransactionalSavepoint(object);
+						break;
+					}
 				}
 
 				releaseSavepoint(object, type, sub);
@@ -3015,6 +3093,20 @@ compatibility_check(void)
 		elog(ERROR, "pg_variables extension is incompatible with connection pooling");
 	}
 #endif							/* PGPRO_EE */
+}
+
+static bool
+shouldDiscardTransactionalOnCommit(void)
+{
+	if (!IsTransactionBlock())
+		return false;
+
+#ifdef PGPRO_EE
+	if (getNestLevelATX() > 0)
+		return false;
+#endif
+
+	return true;
 }
 
 #ifdef PGPRO_EE
@@ -3232,13 +3324,17 @@ pgvTransCallback(XactEvent event, void *arg)
 		{
 			case XACT_EVENT_PRE_COMMIT:
 				compatibility_check();
-				processChanges(RELEASE_SAVEPOINT, false);
+				processChanges(shouldDiscardTransactionalOnCommit() ?
+							   DISCARD_TRANSACTIONAL_SAVEPOINT :
+							   RELEASE_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_ABORT:
 				processChanges(ROLLBACK_TO_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_PARALLEL_PRE_COMMIT:
-				processChanges(RELEASE_SAVEPOINT, false);
+				processChanges(shouldDiscardTransactionalOnCommit() ?
+							   DISCARD_TRANSACTIONAL_SAVEPOINT :
+							   RELEASE_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_PARALLEL_ABORT:
 				processChanges(ROLLBACK_TO_SAVEPOINT, false);
