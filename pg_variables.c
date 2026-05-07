@@ -3101,9 +3101,6 @@ compatibility_check(void)
 static bool
 shouldDiscardTransactionalOnCommit(void)
 {
-	if (!IsTransactionBlock())
-		return false;
-
 #ifdef PGPRO_EE
 	if (getNestLevelATX() > 0)
 		return false;

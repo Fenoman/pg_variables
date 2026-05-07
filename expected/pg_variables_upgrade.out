@@ -14,7 +14,7 @@ SELECT extversion AS upgraded_version FROM pg_extension WHERE extname = 'pg_vari
  1.4.0
 (1 row)
 
-SELECT pgv_set('upgrade_10', 'v', 10::int, true);
+SELECT pgv_set('upgrade_10', 'v', 10::int, false);
  pgv_set 
 ---------
  
@@ -48,7 +48,7 @@ SELECT extversion AS upgraded_version FROM pg_extension WHERE extname = 'pg_vari
  1.4.0
 (1 row)
 
-SELECT pgv_set_text('upgrade_11', 'v', 'eleven', true);
+SELECT pgv_set_text('upgrade_11', 'v', 'eleven', false);
  pgv_set_text 
 --------------
  
@@ -173,7 +173,7 @@ WHERE n.nspname = 'public'
                            0
 (1 row)
 
-SELECT pgv_set_int('upgrade_13', 'v', 13, true);
+SELECT pgv_set_int('upgrade_13', 'v', 13, false);
  pgv_set_int 
 -------------
  
@@ -191,7 +191,7 @@ SELECT * FROM upgrade_dep_exists;
  t              | t
 (1 row)
 
-SELECT pgv_insert('upgrade_13', 'r', ROW(13::int, 'thirteen'::text), true);
+SELECT pgv_insert('upgrade_13', 'r', ROW(13::int, 'thirteen'::text), false);
  pgv_insert 
 ------------
  

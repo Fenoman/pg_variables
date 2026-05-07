@@ -96,10 +96,9 @@ SELECT pgv_select('vars3', 'r1');
 SELECT pgv_select('vars3', 'r2');
 COMMIT;
 
--- Re-create transactional variables outside an explicit transaction.  The
--- savepoint tests below still need persistent transactional variables as their
--- starting point, while explicit-transaction TRUE changes are now discarded on
--- COMMIT.
+--CHECK SAVEPOINT ROLLBACK
+BEGIN;
+-- Establish the transaction-local baseline before the savepoint.
 SELECT pgv_set('vars', 'any1', 'another value'::text, true);
 SELECT pgv_set_int('vars', 'int1', 103, true);
 SELECT pgv_set_int('vars', 'intNULL', 104, true);
@@ -109,14 +108,6 @@ SELECT pgv_set_timestamp('vars', 'ts1', '2016-03-30 12:00:00', true);
 SELECT pgv_set_timestamptz('vars', 'tstz1', '2016-03-30 12:00:00 GMT+03', true);
 SELECT pgv_set_date('vars', 'd1', '2016-04-02', true);
 SELECT pgv_set_jsonb('vars2', 'j1', '{"foo": [true, "bar"], "tags": {"a": 1, "b": null}}', true);
-SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
-SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
-
-
-
---CHECK SAVEPOINT ROLLBACK
-BEGIN;
--- Variables are already declared
 SAVEPOINT comm2;
 -- Set new values
 SELECT pgv_set('vars', 'any1', 'one more value'::text, true);
@@ -180,6 +171,8 @@ COMMIT;
 
 -- Record variables
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
+SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
 SAVEPOINT comm2;
 SELECT pgv_delete('vars3', 'r1', 5);
 SELECT pgv_delete('vars3', 'r2', 5);
@@ -192,27 +185,25 @@ COMMIT;
 
 
 -- TRYING TO CHANGE FLAG 'IS_TRANSACTIONAL'
+SELECT pgv_free();
+BEGIN;
+SELECT pgv_set('vars', 'any1', 'value'::text, true);
+SELECT pgv_set('vars', 'any2', 'value'::text);
+SAVEPOINT flag_change;
 SELECT pgv_set('vars', 'any1', 'value'::text);
+ROLLBACK TO flag_change;
 SELECT pgv_set('vars', 'any2', 'value'::text, true);
-SELECT pgv_set_int('vars', 'int1', 301);
-SELECT pgv_set_int('vars', 'int2', 302, true);
-SELECT pgv_set_text('vars', 'str1', 's301');
-SELECT pgv_set_text('vars', 'str2', 's302', true);
-SELECT pgv_set_numeric('vars', 'num1', 3.01);
-SELECT pgv_set_numeric('vars', 'num2', 3.02, true);
-SELECT pgv_set_timestamp('vars', 'ts1', '2016-03-30 20:00:00');
-SELECT pgv_set_timestamp('vars', 'ts2', '2016-03-30 21:00:00', true);
-SELECT pgv_set_timestamptz('vars', 'tstz1', '2016-03-30 20:00:00 GMT+01');
-SELECT pgv_set_timestamptz('vars', 'tstz2', '2016-03-30 21:00:00 GMT+02', true);
-SELECT pgv_set_date('vars', 'd1', '2016-04-29');
-SELECT pgv_set_date('vars', 'd2', '2016-04-30', true);
-SELECT pgv_set_jsonb('vars2', 'j1', '[1, 2, "foo2", null]');
-SELECT pgv_set_jsonb('vars2', 'j2', '{"bar": "baz2", "balance": 7.77, "active": true}', true);
-SELECT pgv_insert('vars3', 'r1', row(6 :: integer, 'str66' :: varchar));
-SELECT pgv_insert('vars3', 'r2', row(6 :: integer, 'str66' :: varchar),true);
+ROLLBACK TO flag_change;
+SELECT pgv_insert('vars3', 'r1', row(6 :: integer, 'str66' :: varchar), true);
+SELECT pgv_insert('vars3', 'r2', row(6 :: integer, 'str66' :: varchar));
+SELECT pgv_insert('vars3', 'r1', row(7 :: integer, 'str77' :: varchar));
+ROLLBACK TO flag_change;
+SELECT pgv_insert('vars3', 'r2', row(7 :: integer, 'str77' :: varchar),true);
+ROLLBACK TO flag_change;
 
--- CHECK pgv_list() WHILE WE HAVE A LOT OF MISCELLANEOUS VARIABLES
+-- CHECK pgv_list() WHILE WE HAVE MISCELLANEOUS VARIABLES
 SELECT * FROM pgv_list() order by package, name;
+ROLLBACK;
 
 SELECT pgv_free();
 
@@ -260,7 +251,6 @@ SELECT pgv_free();
 
 --CHECK TRANSACTION COMMIT
 -- Declare variables
-SELECT pgv_set('vars', 'any1', 'some value'::text, true);
 SELECT pgv_set('vars', 'any2', 'some value'::text);
 
 BEGIN;
@@ -276,9 +266,9 @@ SELECT pgv_get('vars', 'any1',NULL::text);
 SELECT pgv_get('vars', 'any2',NULL::text);
 
 
-SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
 SELECT pgv_insert('vars3', 'r2', tab) FROM tab;
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
 SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
 SELECT pgv_insert('vars3', 'r2', row(5 :: integer, 'str55' :: varchar));
 SELECT pgv_select('vars3', 'r1');
@@ -306,6 +296,7 @@ SELECT pgv_get('vars', 'any2',NULL::text);
 
 -- Record variables
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
 SELECT pgv_delete('vars3', 'r1', 5);
 SELECT pgv_delete('vars3', 'r2', 5);
 SELECT pgv_select('vars3', 'r1');
@@ -333,8 +324,9 @@ SELECT pgv_remove('vars');
 
 
 -- CHECK ROLLBACK AFTER COMMITTING SUBTRANSACTION
-SELECT pgv_set('vars', 'any1', 'before transaction block'::text, true);
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'before transaction block'::text, true);
+SAVEPOINT outer_sp;
 SELECT pgv_set('vars', 'any1', 'before savepoint sp1'::text, true);
 SAVEPOINT sp1;
 SELECT pgv_set('vars', 'any1', 'after savepoint sp1'::text, true);
@@ -343,6 +335,8 @@ SELECT pgv_set('vars', 'any1', 'after savepoint sp2'::text, true);
 RELEASE sp2;
 SELECT pgv_get('vars', 'any1',NULL::text);
 ROLLBACK TO sp1;
+SELECT pgv_get('vars', 'any1',NULL::text);
+ROLLBACK TO outer_sp;
 SELECT pgv_get('vars', 'any1',NULL::text);
 ROLLBACK;
 SELECT pgv_get('vars', 'any1',NULL::text);
@@ -358,8 +352,8 @@ SELECT pgv_get('vars2', 'any1',NULL::text);
 SELECT pgv_free();
 
 -- Additional tests
-SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
 SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'before savepoint sp1' :: varchar),true);
 SAVEPOINT sp1;
 SELECT pgv_update('vars3', 'r1', row(5 :: integer, 'after savepoint sp1' :: varchar));
@@ -383,8 +377,9 @@ SELECT pgv_select('vars3', 'r1');
 COMMIT;
 SELECT pgv_select('vars3', 'r1');
 
-SELECT pgv_set('vars', 'any1', 'outer'::text, true);
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'outer'::text, true);
+SAVEPOINT outer_sp;
 SELECT pgv_set('vars', 'any1', 'begin'::text, true);
 SAVEPOINT sp1;
 SELECT pgv_set('vars', 'any1', 'sp1'::text, true);
@@ -405,23 +400,29 @@ RELEASE sp2;
 SELECT pgv_get('vars', 'any1',NULL::text);
 ROLLBACK TO sp1;
 SELECT pgv_get('vars', 'any1',NULL::text);
+ROLLBACK TO outer_sp;
+SELECT pgv_get('vars', 'any1',NULL::text);
 ROLLBACK;
 SELECT pgv_get('vars', 'any1',NULL::text);
 
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'text value'::text, true);
 SELECT pgv_set('vars', 'any1', 'wrong type'::varchar, true);
 COMMIT;
 
 -- THE REMOVAL OF THE VARIABLE MUST BE CANCELED ON ROLLBACK
-SELECT pgv_set('vars', 'any1', 'variable exists'::text, true);
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'variable exists'::text, true);
+SAVEPOINT remove_var_sp;
 SELECT pgv_remove('vars', 'any1');
 SELECT pgv_exists('vars', 'any1');
-ROLLBACK;
+ROLLBACK TO remove_var_sp;
 SELECT pgv_exists('vars', 'any1');
 SELECT pgv_get('vars', 'any1',NULL::text);
+ROLLBACK;
 
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'variable exists'::text, true);
 SELECT pgv_remove('vars', 'any1');
 SELECT pgv_exists('vars', 'any1');
 COMMIT;
@@ -632,27 +633,23 @@ SELECT pgv_select('test', 'z');
 SELECT pgv_free();
 
 -- Variables should be rollbackable if transactional
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 SELECT pgv_insert('test', 'x', ROW (2::int, 3::int), TRUE);
 SELECT pgv_select('test', 'x');
-
-BEGIN;
+SAVEPOINT rollback_trans_var;
 SELECT pgv_remove('test', 'x');
-ROLLBACK;
-
+ROLLBACK TO rollback_trans_var;
 SELECT pgv_select('test', 'x');
-
-BEGIN;
+SAVEPOINT rollback_trans_pack;
 SELECT pgv_remove('test');
-ROLLBACK;
-
+ROLLBACK TO rollback_trans_pack;
 SELECT pgv_select('test', 'x');
-
-BEGIN;
+SAVEPOINT rollback_trans_free;
 SELECT pgv_free();
-ROLLBACK;
-
+ROLLBACK TO rollback_trans_free;
 SELECT pgv_select('test', 'x');
+ROLLBACK;
 
 ---
 --- Variables should not be rollbackable if not transactional
@@ -693,8 +690,8 @@ SELECT pgv_free();
 ---
 --- Cursors test #1 (remove var)
 ---
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_remove('test', 'x');
 FETCH 1 in r1_cur;
@@ -713,8 +710,8 @@ SELECT pgv_free();
 ---
 --- Cursors test #2 (remove pack)
 ---
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_remove('test');
 FETCH 1 in r1_cur;
@@ -733,8 +730,8 @@ SELECT pgv_free();
 ---
 --- Cursors test #3 (free)
 ---
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_free();
 FETCH 1 in r1_cur;
@@ -782,8 +779,8 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 
 -- transactional, remove var
-SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_remove('test', 'y');
 FETCH 1 in r1_cur;
@@ -792,8 +789,8 @@ SELECT pgv_select('test', 'y');
 SELECT pgv_free();
 
 -- transactional, remove pack
-SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_remove('test');
 FETCH 1 in r1_cur;
@@ -802,8 +799,8 @@ SELECT pgv_select('test', 'y');
 SELECT pgv_free();
 
 -- transactional, free
-SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_free();
 FETCH 1 in r1_cur;
@@ -844,8 +841,8 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 
 -- transactional
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
 SELECT pgv_remove('test', 'x');
@@ -854,6 +851,7 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
 SELECT pgv_remove('test');
@@ -862,6 +860,7 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 
 BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
 SELECT pgv_free();
@@ -900,9 +899,9 @@ SELECT pgv_select('test', 'x') LIMIT 2;
 SELECT pgv_select('test', 'x') LIMIT 3;
 COMMIT;
 
-SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
-SELECT pgv_insert('test', 'y', ROW (2::int, 3::int), TRUE);
-SELECT pgv_insert('test', 'y', ROW (3::int, 4::int), TRUE);
+SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
+SELECT pgv_insert('test', 'y', ROW (2::int, 3::int), FALSE);
+SELECT pgv_insert('test', 'y', ROW (3::int, 4::int), FALSE);
 SELECT pgv_select('test', 'y') LIMIT 1;
 SELECT pgv_select('test', 'y') LIMIT 2;
 SELECT pgv_select('test', 'y') LIMIT 3;
@@ -989,8 +988,8 @@ COMMIT;
 --- Some special cases
 ---
 -- take #1
-SELECT pgv_insert('test', 'z1', ROW (2::int, 2::int), TRUE);
 BEGIN;
+SELECT pgv_insert('test', 'z1', ROW (2::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'z1');
 FETCH 1 in r1_cur;
 SELECT pgv_remove('test', 'z1');
@@ -1009,9 +1008,8 @@ ROLLBACK;
 SELECT pgv_select('test', 'z2');
 SELECT pgv_insert('test', 'z2', ROW (1::int, 2::int), FALSE);
 -- take #3
-SELECT pgv_insert('test', 'z3', ROW (1::int, 2::int), TRUE);
-
 BEGIN;
+SELECT pgv_insert('test', 'z3', ROW (1::int, 2::int), TRUE);
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'z3');
 FETCH 1 in r1_cur;
 CLOSE r1_cur;
@@ -1029,8 +1027,8 @@ SELECT pgv_select('test', 'z3');
 
 SELECT pgv_free();
 -- take #4
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
-SELECT pgv_insert('test', 'x', ROW (2::int, 3::int), TRUE);
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), FALSE);
+SELECT pgv_insert('test', 'x', ROW (2::int, 3::int), FALSE);
 
 BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');

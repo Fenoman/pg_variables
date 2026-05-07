@@ -113,7 +113,7 @@ ERROR:  current transaction is aborted, commands ignored until end of transactio
 		commit;
 -- 103:
 		select pgv_get('vars', 'int3', null::int);
-ERROR:  unrecognized variable "int3"
+ERROR:  unrecognized package "vars"
 	commit;
 WARNING:  there is no transaction in progress
 	select pgv_set('vars', 'int1', 1001, true);
@@ -124,29 +124,20 @@ WARNING:  there is no transaction in progress
 
 -- 1001:
 	select pgv_get('vars', 'int1', null::int);
- pgv_get 
----------
-    1001
-(1 row)
-
+ERROR:  unrecognized package "vars"
 -- 102:
 	select pgv_get('vars', 'int2', null::int);
-ERROR:  unrecognized variable "int2"
+ERROR:  unrecognized package "vars"
 rollback;
 WARNING:  there is no transaction in progress
 -- 101:
 select pgv_get('vars', 'int1', null::int);
- pgv_get 
----------
-    1001
-(1 row)
-
+ERROR:  unrecognized package "vars"
 -- vars:int1:
 select * from pgv_list() order by package, name;
  package | name | is_transactional 
 ---------+------+------------------
- vars    | int1 | t
-(1 row)
+(0 rows)
 
 select pgv_free();
  pgv_free 
@@ -437,11 +428,10 @@ rollback;
 WARNING:  there is no transaction in progress
 -- vars1:int1, vars1:trans_int1
 select * from pgv_list() order by package, name;
- package |    name    | is_transactional 
----------+------------+------------------
- vars1   | int1       | f
- vars1   | trans_int1 | t
-(2 rows)
+ package | name | is_transactional 
+---------+------+------------------
+ vars1   | int1 | f
+(1 row)
 
 -- 1
 select pgv_get('vars1', 'int1', null::int);
@@ -452,11 +442,7 @@ select pgv_get('vars1', 'int1', null::int);
 
 -- 0
 select pgv_get('vars1', 'trans_int1', null::int);
- pgv_get 
----------
-       0
-(1 row)
-
+ERROR:  unrecognized variable "trans_int1"
 select pgv_free();
  pgv_free 
 ----------

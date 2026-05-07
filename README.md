@@ -324,12 +324,11 @@ SELECT pgv_free();
 
 If you want variables with support of transactions and savepoints, you should
 add flag `is_transactional = true` as the last argument in functions `pgv_set()`
-or `pgv_insert()`.  Transactional variables created or changed in a standalone
-statement are stored in the session as before.  Transactional variables created
-or changed inside an explicit transaction block are transaction-local: at the
-top-level `COMMIT`, new variables disappear and changes to existing variables
-are reverted to the state that existed before `BEGIN`.  Non-transactional
-variables are not affected by this rule.
+or `pgv_insert()`. Transactional variables are local to the current top-level
+transaction, including standalone autocommit statements: at top-level `COMMIT`,
+new variables disappear and changes to existing variables are reverted to the
+state that existed before the transaction. Non-transactional variables are not
+affected by this rule.
 
 Explicit `pgv_remove(package)` inside an explicit transaction block remains
 effective after `COMMIT`: the whole package is removed, including its
@@ -346,7 +345,6 @@ the materialized in-transaction snapshot after `COMMIT`, even though subsequent
 Following use cases describe behavior of transactional variables:
 
 ```sql
-SELECT pgv_set('pack', 'var_text', 'before transaction block'::text, true);
 BEGIN;
 SELECT pgv_set('pack', 'var_text', 'before savepoint'::text, true);
 SAVEPOINT sp1;
@@ -365,11 +363,9 @@ SELECT pgv_get('pack', 'var_text', NULL::text);
 ------------------
  before savepoint
 
-ROLLBACK;
+COMMIT;
 SELECT pgv_get('pack', 'var_text', NULL::text);
-         pgv_get
---------------------------
- before transaction block
+ERROR:  unrecognized package "pack"
 ```
 
 If you create a transactional variable after `BEGIN` or `SAVEPOINT` statements
@@ -392,30 +388,26 @@ ERROR:  unrecognized variable "var_int"
 COMMIT;
 ```
 
-You can undo removal of a transactional variable by `ROLLBACK`, but if you remove
-a whole package, all regular variables will be removed permanently:
+You can undo removal of a transactional variable by rolling back to a savepoint,
+but if you remove a whole package, all regular variables will be removed
+permanently:
 
 ```sql
-SELECT pgv_set('pack', 'var_reg', 123);
-SELECT pgv_set('pack', 'var_trans', 456, true);
 BEGIN;
-SELECT pgv_free();
+SELECT pgv_set('pack', 'var_trans', 456, true);
+SAVEPOINT sp1;
+SELECT pgv_remove('pack', 'var_trans');
 SELECT * FROM pgv_list();
  package | name | is_transactional
 ---------+------+------------------
 (0 rows)
 
--- Memory is allocated yet
-SELECT * FROM pgv_stats();
- package | allocated_memory
----------+------------------
- pack    |            24576
-
-ROLLBACK;
+ROLLBACK TO sp1;
 SELECT * FROM pgv_list();
  package |   name    | is_transactional
 ---------+-----------+------------------
  pack    | var_trans | t
+COMMIT;
 ```
 
 If you created transactional variable once, you should use flag `is_transactional`

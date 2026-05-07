@@ -5,7 +5,7 @@ CREATE EXTENSION pg_variables VERSION '1.0';
 SELECT extversion AS installed_version FROM pg_extension WHERE extname = 'pg_variables';
 ALTER EXTENSION pg_variables UPDATE TO '1.4.0';
 SELECT extversion AS upgraded_version FROM pg_extension WHERE extname = 'pg_variables';
-SELECT pgv_set('upgrade_10', 'v', 10::int, true);
+SELECT pgv_set('upgrade_10', 'v', 10::int, false);
 SELECT pgv_get('upgrade_10', 'v', NULL::int);
 SELECT pgv_free();
 DROP EXTENSION pg_variables;
@@ -15,7 +15,7 @@ ALTER EXTENSION pg_variables UPDATE TO '1.1';
 SELECT extversion AS installed_version FROM pg_extension WHERE extname = 'pg_variables';
 ALTER EXTENSION pg_variables UPDATE TO '1.4.0';
 SELECT extversion AS upgraded_version FROM pg_extension WHERE extname = 'pg_variables';
-SELECT pgv_set_text('upgrade_11', 'v', 'eleven', true);
+SELECT pgv_set_text('upgrade_11', 'v', 'eleven', false);
 SELECT pgv_get_text('upgrade_11', 'v');
 SELECT pgv_free();
 DROP EXTENSION pg_variables;
@@ -87,10 +87,10 @@ WHERE n.nspname = 'public'
     'pgv_prior', 'pgv_get_elem', 'pgv_set_elem', 'pgv_remove_elem',
     'pgv_select_support'
   ]);
-SELECT pgv_set_int('upgrade_13', 'v', 13, true);
+SELECT pgv_set_int('upgrade_13', 'v', 13, false);
 SELECT upgrade_dep_get();
 SELECT * FROM upgrade_dep_exists;
-SELECT pgv_insert('upgrade_13', 'r', ROW(13::int, 'thirteen'::text), true);
+SELECT pgv_insert('upgrade_13', 'r', ROW(13::int, 'thirteen'::text), false);
 SELECT * FROM upgrade_dep_select;
 SELECT pgv_free();
 DROP VIEW upgrade_dep_exists;

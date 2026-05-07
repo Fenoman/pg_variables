@@ -492,10 +492,9 @@ SELECT pgv_select('vars3', 'r2');
 (5 rows)
 
 COMMIT;
--- Re-create transactional variables outside an explicit transaction.  The
--- savepoint tests below still need persistent transactional variables as their
--- starting point, while explicit-transaction TRUE changes are now discarded on
--- COMMIT.
+--CHECK SAVEPOINT ROLLBACK
+BEGIN;
+-- Establish the transaction-local baseline before the savepoint.
 SELECT pgv_set('vars', 'any1', 'another value'::text, true);
  pgv_set 
 ---------
@@ -550,24 +549,6 @@ SELECT pgv_set_jsonb('vars2', 'j1', '{"foo": [true, "bar"], "tags": {"a": 1, "b"
  
 (1 row)
 
-SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
- pgv_insert 
-------------
- 
- 
- 
- 
-(4 rows)
-
-SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
- pgv_insert 
-------------
- 
-(1 row)
-
---CHECK SAVEPOINT ROLLBACK
-BEGIN;
--- Variables are already declared
 SAVEPOINT comm2;
 -- Set new values
 SELECT pgv_set('vars', 'any1', 'one more value'::text, true);
@@ -882,6 +863,21 @@ SELECT pgv_get_jsonb('vars2', 'j2');
 COMMIT;
 -- Record variables
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
+ pgv_insert 
+------------
+ 
+ 
+ 
+ 
+(4 rows)
+
+SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
 SAVEPOINT comm2;
 SELECT pgv_delete('vars3', 'r1', 5);
  pgv_delete 
@@ -935,67 +931,60 @@ SELECT pgv_select('vars3', 'r2');
 
 COMMIT;
 -- TRYING TO CHANGE FLAG 'IS_TRANSACTIONAL'
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('vars', 'any1', 'value'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('vars', 'any2', 'value'::text);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT flag_change;
 SELECT pgv_set('vars', 'any1', 'value'::text);
 ERROR:  variable "any1" already created as TRANSACTIONAL
+ROLLBACK TO flag_change;
 SELECT pgv_set('vars', 'any2', 'value'::text, true);
 ERROR:  variable "any2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_int('vars', 'int1', 301);
-ERROR:  variable "int1" already created as TRANSACTIONAL
-SELECT pgv_set_int('vars', 'int2', 302, true);
-ERROR:  variable "int2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_text('vars', 'str1', 's301');
-ERROR:  variable "str1" already created as TRANSACTIONAL
-SELECT pgv_set_text('vars', 'str2', 's302', true);
-ERROR:  variable "str2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_numeric('vars', 'num1', 3.01);
-ERROR:  variable "num1" already created as TRANSACTIONAL
-SELECT pgv_set_numeric('vars', 'num2', 3.02, true);
-ERROR:  variable "num2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_timestamp('vars', 'ts1', '2016-03-30 20:00:00');
-ERROR:  variable "ts1" already created as TRANSACTIONAL
-SELECT pgv_set_timestamp('vars', 'ts2', '2016-03-30 21:00:00', true);
-ERROR:  variable "ts2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_timestamptz('vars', 'tstz1', '2016-03-30 20:00:00 GMT+01');
-ERROR:  variable "tstz1" already created as TRANSACTIONAL
-SELECT pgv_set_timestamptz('vars', 'tstz2', '2016-03-30 21:00:00 GMT+02', true);
-ERROR:  variable "tstz2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_date('vars', 'd1', '2016-04-29');
-ERROR:  variable "d1" already created as TRANSACTIONAL
-SELECT pgv_set_date('vars', 'd2', '2016-04-30', true);
-ERROR:  variable "d2" already created as NOT TRANSACTIONAL
-SELECT pgv_set_jsonb('vars2', 'j1', '[1, 2, "foo2", null]');
-ERROR:  variable "j1" already created as TRANSACTIONAL
-SELECT pgv_set_jsonb('vars2', 'j2', '{"bar": "baz2", "balance": 7.77, "active": true}', true);
-ERROR:  variable "j2" already created as NOT TRANSACTIONAL
-SELECT pgv_insert('vars3', 'r1', row(6 :: integer, 'str66' :: varchar));
-ERROR:  variable "r1" already created as TRANSACTIONAL
-SELECT pgv_insert('vars3', 'r2', row(6 :: integer, 'str66' :: varchar),true);
-ERROR:  variable "r2" already created as NOT TRANSACTIONAL
--- CHECK pgv_list() WHILE WE HAVE A LOT OF MISCELLANEOUS VARIABLES
-SELECT * FROM pgv_list() order by package, name;
- package |  name   | is_transactional 
----------+---------+------------------
- vars    | any1    | t
- vars    | any2    | f
- vars    | d1      | t
- vars    | d2      | f
- vars    | int1    | t
- vars    | int2    | f
- vars    | intNULL | t
- vars    | num1    | t
- vars    | num2    | f
- vars    | str1    | t
- vars    | str2    | f
- vars    | ts1     | t
- vars    | ts2     | f
- vars    | tstz1   | t
- vars    | tstz2   | f
- vars2   | j1      | t
- vars2   | j2      | f
- vars3   | r1      | t
- vars3   | r2      | f
-(19 rows)
+ROLLBACK TO flag_change;
+SELECT pgv_insert('vars3', 'r1', row(6 :: integer, 'str66' :: varchar), true);
+ pgv_insert 
+------------
+ 
+(1 row)
 
+SELECT pgv_insert('vars3', 'r2', row(6 :: integer, 'str66' :: varchar));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('vars3', 'r1', row(7 :: integer, 'str77' :: varchar));
+ERROR:  variable "r1" already created as TRANSACTIONAL
+ROLLBACK TO flag_change;
+SELECT pgv_insert('vars3', 'r2', row(7 :: integer, 'str77' :: varchar),true);
+ERROR:  variable "r2" already created as NOT TRANSACTIONAL
+ROLLBACK TO flag_change;
+-- CHECK pgv_list() WHILE WE HAVE MISCELLANEOUS VARIABLES
+SELECT * FROM pgv_list() order by package, name;
+ package | name | is_transactional 
+---------+------+------------------
+ vars    | any1 | t
+ vars    | any2 | f
+ vars3   | r2   | f
+(3 rows)
+
+ROLLBACK;
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -1119,12 +1108,6 @@ SELECT pgv_free();
 
 --CHECK TRANSACTION COMMIT
 -- Declare variables
-SELECT pgv_set('vars', 'any1', 'some value'::text, true);
- pgv_set 
----------
- 
-(1 row)
-
 SELECT pgv_set('vars', 'any2', 'some value'::text);
  pgv_set 
 ---------
@@ -1161,25 +1144,12 @@ SELECT pgv_get('vars', 'any2',NULL::text);
 -- Check values after committing transaction
 COMMIT;
 SELECT pgv_get('vars', 'any1',NULL::text);
-  pgv_get   
-------------
- some value
-(1 row)
-
+ERROR:  unrecognized variable "any1"
 SELECT pgv_get('vars', 'any2',NULL::text);
     pgv_get    
 ---------------
  another value
 (1 row)
-
-SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
- pgv_insert 
-------------
- 
- 
- 
- 
-(4 rows)
 
 SELECT pgv_insert('vars3', 'r2', tab) FROM tab;
  pgv_insert 
@@ -1191,6 +1161,15 @@ SELECT pgv_insert('vars3', 'r2', tab) FROM tab;
 (4 rows)
 
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
+ pgv_insert 
+------------
+ 
+ 
+ 
+ 
+(4 rows)
+
 SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'str55' :: varchar),true);
  pgv_insert 
 ------------
@@ -1225,14 +1204,7 @@ SELECT pgv_select('vars3', 'r2');
 
 COMMIT;
 SELECT pgv_select('vars3', 'r1');
- pgv_select 
-------------
- (,strNULL)
- (1,str33)
- (2,)
- (0,str00)
-(4 rows)
-
+ERROR:  unrecognized variable "r1"
 SELECT pgv_select('vars3', 'r2');
  pgv_select 
 ------------
@@ -1275,11 +1247,7 @@ SELECT pgv_get('vars', 'any2',NULL::text);
 -- Check values after rollback
 ROLLBACK;
 SELECT pgv_get('vars', 'any1',NULL::text);
-  pgv_get   
-------------
- some value
-(1 row)
-
+ERROR:  unrecognized variable "any1"
 SELECT pgv_get('vars', 'any2',NULL::text);
     pgv_get     
 ----------------
@@ -1288,6 +1256,15 @@ SELECT pgv_get('vars', 'any2',NULL::text);
 
 -- Record variables
 BEGIN;
+SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
+ pgv_insert 
+------------
+ 
+ 
+ 
+ 
+(4 rows)
+
 SELECT pgv_delete('vars3', 'r1', 5);
  pgv_delete 
 ------------
@@ -1320,14 +1297,7 @@ SELECT pgv_select('vars3', 'r2');
 
 ROLLBACK;
 SELECT pgv_select('vars3', 'r1');
- pgv_select 
-------------
- (,strNULL)
- (1,str33)
- (2,)
- (0,str00)
-(4 rows)
-
+ERROR:  unrecognized variable "r1"
 SELECT pgv_select('vars3', 'r2');
  pgv_select 
 ------------
@@ -1393,13 +1363,14 @@ SELECT pgv_remove('vars');
 (1 row)
 
 -- CHECK ROLLBACK AFTER COMMITTING SUBTRANSACTION
+BEGIN;
 SELECT pgv_set('vars', 'any1', 'before transaction block'::text, true);
  pgv_set 
 ---------
  
 (1 row)
 
-BEGIN;
+SAVEPOINT outer_sp;
 SELECT pgv_set('vars', 'any1', 'before savepoint sp1'::text, true);
  pgv_set 
 ---------
@@ -1434,13 +1405,16 @@ SELECT pgv_get('vars', 'any1',NULL::text);
  before savepoint sp1
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO outer_sp;
 SELECT pgv_get('vars', 'any1',NULL::text);
          pgv_get          
 --------------------------
  before transaction block
 (1 row)
 
+ROLLBACK;
+SELECT pgv_get('vars', 'any1',NULL::text);
+ERROR:  unrecognized package "vars"
 BEGIN;
 SAVEPOINT sp1;
 SELECT pgv_set('vars2', 'any1', 'variable exists'::text, true);
@@ -1466,6 +1440,7 @@ SELECT pgv_free();
 (1 row)
 
 -- Additional tests
+BEGIN;
 SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
  pgv_insert 
 ------------
@@ -1475,7 +1450,6 @@ SELECT pgv_insert('vars3', 'r1', tab, true) FROM tab;
  
 (4 rows)
 
-BEGIN;
 SELECT pgv_insert('vars3', 'r1', row(5 :: integer, 'before savepoint sp1' :: varchar),true);
  pgv_insert 
 ------------
@@ -1574,21 +1548,15 @@ SELECT pgv_select('vars3', 'r1');
 
 COMMIT;
 SELECT pgv_select('vars3', 'r1');
- pgv_select 
-------------
- (,strNULL)
- (1,str33)
- (2,)
- (0,str00)
-(4 rows)
-
+ERROR:  unrecognized package "vars3"
+BEGIN;
 SELECT pgv_set('vars', 'any1', 'outer'::text, true);
  pgv_set 
 ---------
  
 (1 row)
 
-BEGIN;
+SAVEPOINT outer_sp;
 SELECT pgv_set('vars', 'any1', 'begin'::text, true);
  pgv_set 
 ---------
@@ -1659,25 +1627,35 @@ SELECT pgv_get('vars', 'any1',NULL::text);
  begin
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO outer_sp;
 SELECT pgv_get('vars', 'any1',NULL::text);
  pgv_get 
 ---------
  outer
 (1 row)
 
+ROLLBACK;
+SELECT pgv_get('vars', 'any1',NULL::text);
+ERROR:  unrecognized package "vars"
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'text value'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
 SELECT pgv_set('vars', 'any1', 'wrong type'::varchar, true);
 ERROR:  variable "any1" requires "text" value
 COMMIT;
 -- THE REMOVAL OF THE VARIABLE MUST BE CANCELED ON ROLLBACK
+BEGIN;
 SELECT pgv_set('vars', 'any1', 'variable exists'::text, true);
  pgv_set 
 ---------
  
 (1 row)
 
-BEGIN;
+SAVEPOINT remove_var_sp;
 SELECT pgv_remove('vars', 'any1');
  pgv_remove 
 ------------
@@ -1690,7 +1668,7 @@ SELECT pgv_exists('vars', 'any1');
  f
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO remove_var_sp;
 SELECT pgv_exists('vars', 'any1');
  pgv_exists 
 ------------
@@ -1703,7 +1681,14 @@ SELECT pgv_get('vars', 'any1',NULL::text);
  variable exists
 (1 row)
 
+ROLLBACK;
 BEGIN;
+SELECT pgv_set('vars', 'any1', 'variable exists'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
 SELECT pgv_remove('vars', 'any1');
  pgv_remove 
 ------------
@@ -1720,21 +1705,15 @@ COMMIT;
 SELECT pgv_exists('vars', 'any1');
  pgv_exists 
 ------------
- t
+ f
 (1 row)
 
 SELECT pgv_get('vars', 'any1',NULL::text);
-     pgv_get     
------------------
- variable exists
-(1 row)
-
+ERROR:  unrecognized package "vars"
 SELECT * FROM pgv_list() ORDER BY package, name;
  package | name | is_transactional 
 ---------+------+------------------
- vars    | any1 | t
- vars3   | r1   | t
-(2 rows)
+(0 rows)
 
 BEGIN;
 SELECT pgv_free();
@@ -1747,9 +1726,7 @@ ROLLBACK;
 SELECT * FROM pgv_list() ORDER BY package, name;
  package | name | is_transactional 
 ---------+------+------------------
- vars    | any1 | t
- vars3   | r1   | t
-(2 rows)
+(0 rows)
 
 BEGIN;
 SELECT pgv_free();
@@ -1819,10 +1796,9 @@ SELECT * FROM pgv_list() ORDER BY package, name;
 
 ROLLBACK;
 SELECT * FROM pgv_list() ORDER BY package, name;
- package |  name  | is_transactional 
----------+--------+------------------
- vars    | trans1 | t
-(1 row)
+ package | name | is_transactional 
+---------+------+------------------
+(0 rows)
 
 BEGIN;
 SAVEPOINT sp1;
@@ -1845,9 +1821,8 @@ SELECT pgv_free();
 SELECT package FROM pgv_stats() ORDER BY package;
  package 
 ---------
- vars
  vars2
-(2 rows)
+(1 row)
 
 SELECT * FROM pgv_list() ORDER BY package, name;
  package | name | is_transactional 
@@ -1858,9 +1833,8 @@ RELEASE sp5;
 SELECT package FROM pgv_stats() ORDER BY package;
  package 
 ---------
- vars
  vars2
-(2 rows)
+(1 row)
 
 SELECT * FROM pgv_list() ORDER BY package, name;
  package | name | is_transactional 
@@ -1871,9 +1845,8 @@ RELEASE sp4;
 SELECT package FROM pgv_stats() ORDER BY package;
  package 
 ---------
- vars
  vars2
-(2 rows)
+(1 row)
 
 SELECT * FROM pgv_list() ORDER BY package, name;
  package | name | is_transactional 
@@ -1978,11 +1951,7 @@ SELECT pgv_insert('vars3', 'r3', row(3 :: integer, NULL::varchar), true);
 
 COMMIT;
 SELECT pgv_delete('vars3', 'r3', 3);
- pgv_delete 
-------------
- f
-(1 row)
-
+ERROR:  unrecognized package "vars3"
 BEGIN;
 SELECT pgv_set('vars1', 't1', ''::text);
  pgv_set 
@@ -2420,6 +2389,7 @@ SELECT pgv_free();
 (1 row)
 
 -- Variables should be rollbackable if transactional
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
@@ -2439,14 +2409,14 @@ SELECT pgv_select('test', 'x');
  (2,3)
 (2 rows)
 
-BEGIN;
+SAVEPOINT rollback_trans_var;
 SELECT pgv_remove('test', 'x');
  pgv_remove 
 ------------
  
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO rollback_trans_var;
 SELECT pgv_select('test', 'x');
  pgv_select 
 ------------
@@ -2454,14 +2424,14 @@ SELECT pgv_select('test', 'x');
  (2,3)
 (2 rows)
 
-BEGIN;
+SAVEPOINT rollback_trans_pack;
 SELECT pgv_remove('test');
  pgv_remove 
 ------------
  
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO rollback_trans_pack;
 SELECT pgv_select('test', 'x');
  pgv_select 
 ------------
@@ -2469,14 +2439,14 @@ SELECT pgv_select('test', 'x');
  (2,3)
 (2 rows)
 
-BEGIN;
+SAVEPOINT rollback_trans_free;
 SELECT pgv_free();
  pgv_free 
 ----------
  
 (1 row)
 
-ROLLBACK;
+ROLLBACK TO rollback_trans_free;
 SELECT pgv_select('test', 'x');
  pgv_select 
 ------------
@@ -2484,6 +2454,7 @@ SELECT pgv_select('test', 'x');
  (2,3)
 (2 rows)
 
+ROLLBACK;
 ---
 --- Variables should not be rollbackable if not transactional
 ---
@@ -2516,7 +2487,7 @@ SELECT pgv_remove('test', 'y');
 
 ROLLBACK;
 SELECT pgv_select('test', 'y');
-ERROR:  unrecognized variable "y"
+ERROR:  unrecognized package "test"
 -- case 2 (remove pack)
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
@@ -2546,7 +2517,7 @@ SELECT pgv_remove('test');
 
 ROLLBACK;
 SELECT pgv_select('test', 'y');
-ERROR:  unrecognized variable "y"
+ERROR:  unrecognized package "test"
 -- case 3 (free)
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
@@ -2576,7 +2547,7 @@ SELECT pgv_free();
 
 ROLLBACK;
 SELECT pgv_select('test', 'y');
-ERROR:  unrecognized variable "y"
+ERROR:  unrecognized package "test"
 -- clear all
 SELECT pgv_free();
  pgv_free 
@@ -2587,13 +2558,13 @@ SELECT pgv_free();
 ---
 --- Cursors test #1 (remove var)
 ---
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_remove('test', 'x');
  pgv_remove 
@@ -2605,11 +2576,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
 ------------
@@ -2625,10 +2592,10 @@ SELECT pgv_remove('test', 'y');
 (1 row)
 
 FETCH 1 in r1_cur;
-ERROR:  unrecognized variable "y"
+ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'y');
-ERROR:  unrecognized variable "y"
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -2638,13 +2605,13 @@ SELECT pgv_free();
 ---
 --- Cursors test #2 (remove pack)
 ---
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_remove('test');
  pgv_remove 
@@ -2656,11 +2623,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
 ------------
@@ -2692,13 +2655,13 @@ SELECT pgv_free();
 ---
 --- Cursors test #3 (free)
 ---
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 SELECT pgv_free();
  pgv_free 
@@ -2710,11 +2673,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
 ------------
@@ -2807,13 +2766,13 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 ERROR:  unrecognized package "test"
 -- transactional, remove var
+BEGIN;
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_remove('test', 'y');
  pgv_remove 
@@ -2825,11 +2784,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'y');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -2837,13 +2792,13 @@ SELECT pgv_free();
 (1 row)
 
 -- transactional, remove pack
+BEGIN;
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_remove('test');
  pgv_remove 
@@ -2855,11 +2810,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'y');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -2867,13 +2818,13 @@ SELECT pgv_free();
 (1 row)
 
 -- transactional, free
+BEGIN;
 SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_free();
  pgv_free 
@@ -2885,11 +2836,7 @@ FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
 SELECT pgv_select('test', 'y');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -2973,13 +2920,13 @@ ROLLBACK;
 SELECT pgv_select('test', 'x');
 ERROR:  unrecognized package "test"
 -- transactional
+BEGIN;
 SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
  pgv_select 
@@ -3000,12 +2947,14 @@ FETCH 1 in r1_cur;
 
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
+ERROR:  unrecognized package "test"
+BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
+ pgv_insert 
 ------------
- (1,2)
+ 
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
  pgv_select 
@@ -3026,12 +2975,14 @@ FETCH 1 in r1_cur;
 
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
+ERROR:  unrecognized package "test"
+BEGIN;
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
+ pgv_insert 
 ------------
- (1,2)
+ 
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
 FETCH 1 in r1_cur;
  pgv_select 
@@ -3052,11 +3003,7 @@ FETCH 1 in r1_cur;
 
 ROLLBACK;
 SELECT pgv_select('test', 'x');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized package "test"
 ---
 --- Cursor test #6
 ---
@@ -3161,19 +3108,19 @@ SELECT pgv_select('test', 'x') LIMIT 3;
 (3 rows)
 
 COMMIT;
-SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), TRUE);
+SELECT pgv_insert('test', 'y', ROW (1::int, 2::int), FALSE);
  pgv_insert 
 ------------
  
 (1 row)
 
-SELECT pgv_insert('test', 'y', ROW (2::int, 3::int), TRUE);
+SELECT pgv_insert('test', 'y', ROW (2::int, 3::int), FALSE);
  pgv_insert 
 ------------
  
 (1 row)
 
-SELECT pgv_insert('test', 'y', ROW (3::int, 4::int), TRUE);
+SELECT pgv_insert('test', 'y', ROW (3::int, 4::int), FALSE);
  pgv_insert 
 ------------
  
@@ -3458,13 +3405,13 @@ COMMIT;
 --- Some special cases
 ---
 -- take #1
+BEGIN;
 SELECT pgv_insert('test', 'z1', ROW (2::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'z1');
 FETCH 1 in r1_cur;
  pgv_select 
@@ -3485,11 +3432,7 @@ FETCH 1 in r1_cur;
 
 ROLLBACK;
 SELECT pgv_select('test', 'z1');
- pgv_select 
-------------
- (2,2)
-(1 row)
-
+ERROR:  unrecognized variable "z1"
 -- take #2
 SELECT pgv_insert('test', 'z2', ROW (2::int, 2::int), FALSE);
  pgv_insert 
@@ -3524,13 +3467,13 @@ SELECT pgv_insert('test', 'z2', ROW (1::int, 2::int), FALSE);
 (1 row)
 
 -- take #3
+BEGIN;
 SELECT pgv_insert('test', 'z3', ROW (1::int, 2::int), TRUE);
  pgv_insert 
 ------------
  
 (1 row)
 
-BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'z3');
 FETCH 1 in r1_cur;
  pgv_select 
@@ -3549,11 +3492,7 @@ FETCH 1 in r1_cur;
 ERROR:  cursor "r1_cur" does not exist
 ROLLBACK;
 SELECT pgv_select('test', 'z3');
- pgv_select 
-------------
- (1,2)
-(1 row)
-
+ERROR:  unrecognized variable "z3"
 --BEGIN;
 --DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'z3');
 --FETCH 1 in r1_cur;
@@ -3567,13 +3506,13 @@ SELECT pgv_free();
 (1 row)
 
 -- take #4
-SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), TRUE);
+SELECT pgv_insert('test', 'x', ROW (1::int, 2::int), FALSE);
  pgv_insert 
 ------------
  
 (1 row)
 
-SELECT pgv_insert('test', 'x', ROW (2::int, 3::int), TRUE);
+SELECT pgv_insert('test', 'x', ROW (2::int, 3::int), FALSE);
  pgv_insert 
 ------------
  
@@ -3654,6 +3593,58 @@ FETCH 1 in r2_cur;
 
 COMMIT;
 SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), TRUE);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+BEGIN;
+DECLARE r1_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
+DECLARE r2_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
+FETCH 1 in r1_cur;
+ pack | mem_mult 
+------+----------
+ test |        0
+(1 row)
+
+FETCH 1 in r2_cur;
+ pack | mem_mult 
+------+----------
+ test |        0
+(1 row)
+
+ROLLBACK;
+SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
+ERROR:  there is a record in the variable "y" with same key
+SELECT pgv_insert('test1', 'x', ROW (2::float, 1::float), FALSE);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+BEGIN;
+DECLARE r1_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
+DECLARE r2_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
+FETCH 1 in r1_cur;
+ pack | mem_mult 
+------+----------
+ test |        0
+(1 row)
+
+FETCH 1 in r2_cur;
+ pack | mem_mult 
+------+----------
+ test |        0
+(1 row)
+
+COMMIT;
+SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
 ERROR:  there is a record in the variable "y" with same key
 BEGIN;
 DECLARE r1_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
@@ -3672,47 +3663,7 @@ FETCH 1 in r2_cur;
 
 ROLLBACK;
 SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
-ERROR:  variable "y" already created as TRANSACTIONAL
-SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
-ERROR:  variable "y" already created as TRANSACTIONAL
-SELECT pgv_insert('test1', 'x', ROW (2::float, 1::float), FALSE);
-ERROR:  variable "x" already created as TRANSACTIONAL
-BEGIN;
-DECLARE r1_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
-DECLARE r2_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
-FETCH 1 in r1_cur;
- pack | mem_mult 
-------+----------
- test |        0
-(1 row)
-
-FETCH 1 in r2_cur;
- pack | mem_mult 
-------+----------
- test |        0
-(1 row)
-
-COMMIT;
-SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
-ERROR:  variable "y" already created as TRANSACTIONAL
-BEGIN;
-DECLARE r1_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
-DECLARE r2_cur CURSOR FOR SELECT pack, mem_mult FROM pgv_stats_view;
-FETCH 1 in r1_cur;
- pack | mem_mult 
-------+----------
- test |        0
-(1 row)
-
-FETCH 1 in r2_cur;
- pack | mem_mult 
-------+----------
- test |        0
-(1 row)
-
-ROLLBACK;
-SELECT pgv_insert('test1', 'y', ROW (2::float, 1::float), FALSE);
-ERROR:  variable "y" already created as TRANSACTIONAL
+ERROR:  there is a record in the variable "y" with same key
 SELECT pgv_free();
  pgv_free 
 ----------

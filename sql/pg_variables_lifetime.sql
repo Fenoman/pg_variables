@@ -17,11 +17,26 @@ SELECT pgv_get('txlocal_mixed', 'regular', NULL::int);
 SELECT pgv_get('txlocal_mixed', 'trans', NULL::int);
 SELECT pgv_free();
 
--- A transactional variable that existed before the explicit transaction must
--- be restored to its previous value after COMMIT.
-SELECT pgv_set('txlocal_existing', 'v', 1::int, TRUE);
+-- Transactional variables created by standalone statements must also be
+-- discarded at top-level commit. This matters for transaction-pool backends
+-- where autocommit statements can otherwise leak session state.
+SELECT pgv_set('txlocal_implicit', 'v', 40::int, TRUE);
+SELECT pgv_get('txlocal_implicit', 'v', NULL::int);
+SELECT pgv_insert('txlocal_implicit_rec', 'r',
+                  ROW (1::int, 'first'::text), TRUE);
+SELECT pgv_insert('txlocal_implicit_rec', 'r',
+                  ROW (1::int, 'second'::text), TRUE);
+SELECT * FROM pgv_select('txlocal_implicit_rec', 'r') AS t(id int, val text);
+
+-- Savepoint rollback restores a transactional variable inside the same
+-- top-level transaction.  The variable is discarded once that transaction
+-- commits.
 BEGIN;
+SELECT pgv_set('txlocal_existing', 'v', 1::int, TRUE);
+SAVEPOINT txlocal_existing_sp;
 SELECT pgv_set('txlocal_existing', 'v', 2::int, TRUE);
+ROLLBACK TO txlocal_existing_sp;
+SELECT pgv_get('txlocal_existing', 'v', NULL::int);
 COMMIT;
 SELECT pgv_get('txlocal_existing', 'v', NULL::int);
 SELECT pgv_free();
@@ -31,6 +46,16 @@ BEGIN;
 SELECT pgv_insert('txlocal_record', 'r', ROW (1::int, 'one'::text), TRUE);
 COMMIT;
 SELECT * FROM pgv_select('txlocal_record', 'r') AS t(id int, label text);
+
+-- A cursor over a transactional record variable must not keep the variable
+-- alive after the top-level transaction commits.
+BEGIN;
+SELECT pgv_insert('txlocal_cursor', 'r', ROW (1::int, 'a'::text), TRUE);
+SELECT pgv_insert('txlocal_cursor', 'r', ROW (2::int, 'b'::text), TRUE);
+DECLARE txlocal_cursor_cur CURSOR FOR SELECT pgv_select('txlocal_cursor', 'r');
+FETCH 1 FROM txlocal_cursor_cur;
+COMMIT;
+SELECT * FROM pgv_select('txlocal_cursor', 'r') AS t(id int, val text);
 
 -- Cache hits must not bypass record/scalar type validation.
 SELECT pgv_set('cache', 'same', 1::int);
@@ -91,13 +116,15 @@ SELECT pgv_free();
 
 -- Rolling back pgv_remove(transactional_variable) must restore the deletion
 -- flag as well as the previous value state.
-SELECT pgv_insert('rollback', 'rec', ROW (1::int, 'a'::text), TRUE);
 BEGIN;
+SELECT pgv_insert('rollback', 'rec', ROW (1::int, 'a'::text), TRUE);
+SAVEPOINT rollback_sp;
 SELECT pgv_remove('rollback', 'rec');
-ROLLBACK;
+ROLLBACK TO rollback_sp;
 SELECT pgv_insert('rollback', 'rec', ROW (2::int, 'b'::text), TRUE);
 SELECT * FROM pgv_select('rollback', 'rec') AS t(id int, val text)
 ORDER BY id;
+COMMIT;
 SELECT pgv_free();
 
 -- Rollback of a transaction that created a record variable must terminate
