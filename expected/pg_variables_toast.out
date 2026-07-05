@@ -1,0 +1,70 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- A by-reference scalar value may reach pgv_set as an on-disk TOAST pointer
+-- (e.g. selected straight from a table column). The value must be inlined when
+-- stored, so it survives deletion of the source row that owns the TOAST chunks.
+CREATE TABLE pgv_toast_src (id int, v text);
+ALTER TABLE pgv_toast_src ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO pgv_toast_src VALUES (1, repeat('abcdefgh', 20000));
+-- The value arrives as an external TOAST pointer straight from the table.
+SELECT pgv_set('toast_pkg', 'scalar', v) FROM pgv_toast_src WHERE id = 1;
+ pgv_set 
+---------
+ 
+(1 row)
+
+-- Destroy the source so the out-of-line TOAST chunks are reclaimed.
+DELETE FROM pgv_toast_src;
+VACUUM pgv_toast_src;
+-- Must still return the stored value intact, not "missing chunk number".
+SELECT length(pgv_get('toast_pkg', 'scalar', NULL::text)) AS scalar_len;
+ scalar_len 
+------------
+     160000
+(1 row)
+
+SELECT pgv_get('toast_pkg', 'scalar', NULL::text) = repeat('abcdefgh', 20000)
+       AS scalar_matches;
+ scalar_matches 
+----------------
+ t
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Record variables already inline external TOAST pointers via
+-- toast_flatten_tuple_to_datum(); verify that behaviour is preserved.
+CREATE TABLE pgv_toast_rec (id int, v text);
+ALTER TABLE pgv_toast_rec ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO pgv_toast_rec VALUES (1, repeat('xy', 60000));
+SELECT pgv_insert('toast_rec_pkg', 'r', t) FROM pgv_toast_rec t WHERE id = 1;
+ pgv_insert 
+------------
+ 
+(1 row)
+
+DELETE FROM pgv_toast_rec;
+VACUUM pgv_toast_rec;
+SELECT id, length(v) AS v_len
+  FROM pgv_select('toast_rec_pkg', 'r') AS x(id int, v text);
+ id | v_len  
+----+--------
+  1 | 120000
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+DROP TABLE pgv_toast_src;
+DROP TABLE pgv_toast_rec;

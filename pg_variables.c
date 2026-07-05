@@ -14,6 +14,18 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+/*
+ * PG 13 split tuptoaster.c into detoast.c/heaptoast.c (commit 8b94dab0) and, in
+ * the same release, renamed heap_tuple_fetch_attr() to detoast_external_attr()
+ * (commit 2e8b6bfa).  Both the header and the function name change at PG 13, so
+ * a single guard provides the modern spelling on older versions.
+ */
+#if PG_VERSION_NUM >= 130000
+#include "access/detoast.h"
+#else
+#include "access/tuptoaster.h"
+#define detoast_external_attr(attr) heap_tuple_fetch_attr(attr)
+#endif
 #include "catalog/pg_type.h"
 #include "parser/scansup.h"
 #include "storage/lock.h"
@@ -829,6 +841,17 @@ variable_set(text *package_name, text *var_name,
 		{
 			MemoryContext oldcxt;
 			MemoryContext valuecontext;
+
+			/*
+			 * A varlena value may arrive as an external TOAST reference
+			 * (on-disk, indirect or expanded) whose target can be freed or
+			 * vacuumed away before the stored value is read back.  Inline any
+			 * such reference now, while preserving in-line compression, so the
+			 * copy kept in the package context is self-contained.
+			 */
+			if (scalar->typlen == -1)
+				value = PointerGetDatum(detoast_external_attr(
+										(struct varlena *) DatumGetPointer(value)));
 
 			valuecontext = pack_hctx(package, is_transactional);
 			oldcxt = MemoryContextSwitchTo(valuecontext);
