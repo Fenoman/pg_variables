@@ -1364,7 +1364,14 @@ variable_select_by_value(PG_FUNCTION_ARGS)
 		Assert(!HeapTupleHeaderHasExternal(
 										   (HeapTupleHeader) DatumGetPointer(item->tuple)));
 
-		PG_RETURN_DATUM(item->tuple);
+		/*
+		 * item->tuple lives in the variable's own memory context and can be
+		 * freed (e.g. by an update or delete of the same record in the same
+		 * query) before the returned Datum is materialised, so hand back a
+		 * copy. This mirrors the datumCopy() that variable_get() does for
+		 * by-reference scalars.
+		 */
+		PG_RETURN_DATUM(datumCopy(item->tuple, false, -1));
 	}
 	else
 		PG_RETURN_NULL();
