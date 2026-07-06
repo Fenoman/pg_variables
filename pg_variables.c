@@ -3408,6 +3408,21 @@ pgvTransCallback(XactEvent event, void *arg)
 			case XACT_EVENT_PARALLEL_ABORT:
 				processChanges(ROLLBACK_TO_SAVEPOINT, false);
 				break;
+			case XACT_EVENT_PRE_PREPARE:
+
+				/*
+				 * Transactional variables live in backend-local memory and
+				 * cannot be handed to the session that eventually commits a
+				 * prepared transaction, so refuse to prepare a transaction that
+				 * modified them (the postgres_fdw pattern). This fires before
+				 * the max_prepared_transactions check; the resulting abort event
+				 * rolls the pending changes back and frees changesStack.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot PREPARE a transaction that has modified transactional variables"),
+						 errdetail("pg_variables keeps transactional variables in backend-local memory, which two-phase commit cannot transfer to the committing session.")));
+				break;
 			default:
 				break;
 		}
