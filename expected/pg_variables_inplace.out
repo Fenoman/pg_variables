@@ -1,0 +1,105 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Rewriting a scalar variable with a same-sized varlena reuses the stored
+-- buffer in place. Verify the stored value always tracks the latest set across
+-- equal / smaller / larger sizes.
+SELECT pgv_set('ip', 's', 'AAAA'::text);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('ip', 's', 'BBBB'::text);        -- same size -> in-place
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('ip', 's', NULL::text) AS same_size;
+ same_size 
+-----------
+ BBBB
+(1 row)
+
+SELECT pgv_set('ip', 's', 'CC'::text);          -- smaller -> copy path
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('ip', 's', NULL::text) AS smaller;
+ smaller 
+---------
+ CC
+(1 row)
+
+SELECT pgv_set('ip', 's', 'DDDDDDDD'::text);    -- larger -> copy path
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('ip', 's', NULL::text) AS larger;
+  larger  
+----------
+ DDDDDDDD
+(1 row)
+
+SELECT pgv_set('ip', 's', NULL::text);          -- to NULL -> free
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('ip', 's', NULL::text, false) AS to_null;
+ to_null 
+---------
+ 
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Transactional variable + savepoint rollback: the savepointed value must be
+-- restored intact even though the current state was overwritten in place.
+BEGIN;
+SELECT pgv_set('ip2', 'v', 'XXXX'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT s;
+SELECT pgv_set('ip2', 'v', 'YYYY'::text, true);  -- same size -> in-place on top state
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('ip2', 'v', NULL::text) AS before_rollback;
+ before_rollback 
+-----------------
+ YYYY
+(1 row)
+
+ROLLBACK TO s;
+SELECT pgv_get('ip2', 'v', NULL::text) AS after_rollback;
+ after_rollback 
+----------------
+ XXXX
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

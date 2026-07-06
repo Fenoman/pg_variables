@@ -828,14 +828,19 @@ variable_set(text *package_name, text *var_name,
 
 	scalar = &(GetActualValue(variable).scalar);
 
-	/* Release memory for variable */
-	if (scalar->typbyval == false && scalar->is_null == false)
-		pfree(DatumGetPointer(scalar->value));
-
-	scalar->is_null = is_null;
-	if (!scalar->is_null)
 	{
-		if (scalar->typbyval)
+		bool		old_is_byref = (!scalar->typbyval && !scalar->is_null);
+		Datum		old_value = scalar->value;
+
+		scalar->is_null = is_null;
+
+		if (is_null)
+		{
+			if (old_is_byref)
+				pfree(DatumGetPointer(old_value));
+			scalar->value = 0;
+		}
+		else if (scalar->typbyval)
 			scalar->value = value;
 		else
 		{
@@ -853,14 +858,40 @@ variable_set(text *package_name, text *var_name,
 				value = PointerGetDatum(detoast_external_attr(
 										(struct varlena *) DatumGetPointer(value)));
 
-			valuecontext = pack_hctx(package, is_transactional);
-			oldcxt = MemoryContextSwitchTo(valuecontext);
-			scalar->value = datumCopy(value, false, scalar->typlen);
-			MemoryContextSwitchTo(oldcxt);
+			/*
+			 * Fast path: when the stored value and the new one are both inline
+			 * (neither external nor compressed) varlenas of the same total size,
+			 * overwrite the existing buffer in place instead of freeing it and
+			 * allocating a fresh copy. Rewriting a variable with a same-sized
+			 * value is a common pattern, and the stored buffer was allocated to
+			 * exactly VARSIZE_ANY() bytes, so the copy fits. Short (1-byte header)
+			 * values are plain inline data and are allowed; only external and
+			 * compressed forms are excluded.
+			 */
+			if (old_is_byref && scalar->typlen == -1 &&
+				!VARATT_IS_EXTERNAL(DatumGetPointer(old_value)) &&
+				!VARATT_IS_COMPRESSED(DatumGetPointer(old_value)) &&
+				!VARATT_IS_EXTERNAL(DatumGetPointer(value)) &&
+				!VARATT_IS_COMPRESSED(DatumGetPointer(value)) &&
+				VARSIZE_ANY(DatumGetPointer(old_value)) ==
+				VARSIZE_ANY(DatumGetPointer(value)))
+			{
+				memcpy(DatumGetPointer(old_value), DatumGetPointer(value),
+					   VARSIZE_ANY(DatumGetPointer(value)));
+				scalar->value = old_value;
+			}
+			else
+			{
+				if (old_is_byref)
+					pfree(DatumGetPointer(old_value));
+
+				valuecontext = pack_hctx(package, is_transactional);
+				oldcxt = MemoryContextSwitchTo(valuecontext);
+				scalar->value = datumCopy(value, false, scalar->typlen);
+				MemoryContextSwitchTo(oldcxt);
+			}
 		}
 	}
-	else
-		scalar->value = 0;
 }
 
 static Datum
