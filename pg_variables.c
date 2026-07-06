@@ -880,7 +880,13 @@ variable_get(text *package_name, text *var_name,
 
 	variable = getCachedVariable(package, var_name, typid, false, strict);
 
-	if (variable == NULL)
+	/*
+	 * getVariableInternal() only errors on an invalid (removed) variable when
+	 * strict is true; at strict=false it returns the stale entry, so honour the
+	 * "does not exist -> NULL" contract here instead of handing back its
+	 * pre-removal value.
+	 */
+	if (variable == NULL || !GetActualState(variable)->is_valid)
 	{
 		*is_null = true;
 		return 0;

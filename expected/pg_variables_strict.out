@@ -1,0 +1,52 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- pgv_get(strict := false) must return NULL for a transactionally removed
+-- variable, not its stale pre-removal value: getVariableInternal() returns the
+-- now-invalid entry at strict=false, so variable_get() has to check validity
+-- itself. Only observable while the package stays alive through another
+-- variable (otherwise the package lookup already returns NULL).
+BEGIN;
+SELECT pgv_set('strictpkg', 'keep', 1);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('strictpkg', 'v', 42, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('strictpkg', 'v');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_exists('strictpkg', 'v') AS var_exists;
+ var_exists 
+------------
+ f
+(1 row)
+
+SELECT pgv_get('strictpkg', 'v', NULL::int, false) AS get_nonstrict;
+ get_nonstrict 
+---------------
+              
+(1 row)
+
+-- strict=true still raises for the removed variable.
+SELECT pgv_get('strictpkg', 'v', NULL::int, true);
+ERROR:  unrecognized variable "v"
+ROLLBACK;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
