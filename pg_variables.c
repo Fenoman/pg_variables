@@ -911,7 +911,10 @@ variable_get(text *package_name, text *var_name,
 		\
 		package_name = PG_GETARG_TEXT_PP(pkg_arg); \
 		var_name = PG_GETARG_TEXT_PP(var_arg); \
-		strict = PG_GETARG_BOOL(strict_arg); \
+		/* None of the getters are STRICT; treat a missing/NULL flag as the \
+		 * SQL default (strict = true). */ \
+		strict = (PG_NARGS() > (strict_arg) && !PG_ARGISNULL(strict_arg)) ? \
+			PG_GETARG_BOOL(strict_arg) : true; \
 		\
 		value = variable_get(package_name, var_name, \
 							 (typid), &isnull, strict); \
@@ -952,7 +955,14 @@ VARIABLE_GET_TEMPLATE(0, 1, 3, array, getCachedArgType(fcinfo, 2))
 		\
 		package_name = PG_GETARG_TEXT_PP(0); \
 		var_name = PG_GETARG_TEXT_PP(1); \
-		is_transactional = PG_GETARG_BOOL(3); \
+		/* \
+		 * The 1.0 catalog still ships 3-argument setters bound to this same \
+		 * C symbol, so args[3] may be out of bounds. Read the flag only when \
+		 * it is actually present (guards a post-pg_upgrade window where a bad \
+		 * read would silently make the value transactional and lose it). \
+		 */ \
+		is_transactional = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? \
+			PG_GETARG_BOOL(3) : false; \
 		\
 		variable_set(package_name, var_name, (typid), \
 					 PG_ARGISNULL(2) ? 0 : PG_GETARG_DATUM(2), \
@@ -1005,7 +1015,9 @@ variable_insert(PG_FUNCTION_ARGS)
 	package_name = PG_GETARG_TEXT_PP(0);
 	var_name = PG_GETARG_TEXT_PP(1);
 	rec = PG_GETARG_HEAPTUPLEHEADER(2);
-	is_transactional = PG_GETARG_BOOL(3);
+	/* See VARIABLE_SET_TEMPLATE: the 1.0 pgv_insert() has no 4th argument. */
+	is_transactional = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ?
+		PG_GETARG_BOOL(3) : false;
 
 	/* Get cached package */
 	if (likely(cachedPackageMatches(package_name, is_transactional, true)))

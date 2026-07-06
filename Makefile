@@ -16,7 +16,7 @@ DATA = pg_variables--1.0.sql \
 
 PGFILEDESC = "pg_variables - sessional variables"
 
-REGRESS = pg_variables_upgrade pg_variables_advisory pg_variables pg_variables_any \
+REGRESS = pg_variables_upgrade pg_variables_oldapi pg_variables_advisory pg_variables pg_variables_any \
 		pg_variables_lifetime pg_variables_toast pg_variables_record_trans \
 		pg_variables_phantom pg_variables_2pc pg_variables_select_lifetime \
 		pg_variables_trans pg_variables_atx pg_variables_atx_pkg
