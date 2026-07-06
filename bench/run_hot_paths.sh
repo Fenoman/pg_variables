@@ -7,9 +7,10 @@ RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
 DBNAME="${DBNAME:-pgvbench}"
 PSQL="${PSQL:-psql}"
 
-ITERATIONS="${ITERATIONS:-100000000}"
-TEXT_ITERATIONS="${TEXT_ITERATIONS:-50000000}"
-RECORD_ITERATIONS="${RECORD_ITERATIONS:-100}"
+ITERATIONS="${ITERATIONS:-10000000}"
+TEXT_ITERATIONS="${TEXT_ITERATIONS:-5000000}"
+RECORD_ITERATIONS="${RECORD_ITERATIONS:-10000}"
+REPEATS="${REPEATS:-3}"
 RUN_TYPED="${RUN_TYPED:-1}"
 RUN_RECORDS="${RUN_RECORDS:-1}"
 
@@ -28,17 +29,32 @@ esac
 mkdir -p "${RESULTS_DIR}"
 OUT="${RESULTS_DIR}/hot_paths_$(date +%Y%m%d_%H%M%S).out"
 
-echo "Writing benchmark output to ${OUT}" >&2
-echo "DBNAME=${DBNAME} ITERATIONS=${ITERATIONS} TEXT_ITERATIONS=${TEXT_ITERATIONS} RECORD_ITERATIONS=${RECORD_ITERATIONS}" >&2
+# Provenance so before/after comparisons are pinned to a build.
+GIT_REV="$(git -C "${SCRIPT_DIR}/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
+git -C "${SCRIPT_DIR}/.." diff --quiet 2>/dev/null || GIT_REV="${GIT_REV} (dirty)"
 
-# PSQL may intentionally contain extra arguments, for example:
-#   PSQL="sudo -u postgres psql" ./bench/run_hot_paths.sh
-# shellcheck disable=SC2086
-${PSQL} -X \
-	-v iterations="${ITERATIONS}" \
-	-v text_iterations="${TEXT_ITERATIONS}" \
-	-v record_iterations="${RECORD_ITERATIONS}" \
-	-v run_typed="${RUN_TYPED_SQL}" \
-	-v run_records="${RUN_RECORDS_SQL}" \
-	-d "${DBNAME}" \
-	-f "${SQL_FILE}" | tee "${OUT}"
+echo "Writing benchmark output to ${OUT}" >&2
+{
+	echo "# git:        ${GIT_REV}"
+	echo "# dbname:     ${DBNAME}"
+	echo "# iterations: ${ITERATIONS}  text: ${TEXT_ITERATIONS}  record: ${RECORD_ITERATIONS}"
+	echo "# repeats:    ${REPEATS}   (compare the median across runs)"
+} | tee "${OUT}"
+
+# Repeat the whole run REPEATS times; each \timing line is one measurement, so
+# the median across runs is what to compare. A single run is dominated by cache
+# warm-up and one-off noise.
+for run in $(seq 1 "${REPEATS}"); do
+	echo "=== run ${run}/${REPEATS} ===" | tee -a "${OUT}"
+	# PSQL may intentionally contain extra arguments, for example:
+	#   PSQL="sudo -u postgres psql" ./bench/run_hot_paths.sh
+	# shellcheck disable=SC2086
+	${PSQL} -X \
+		-v iterations="${ITERATIONS}" \
+		-v text_iterations="${TEXT_ITERATIONS}" \
+		-v record_iterations="${RECORD_ITERATIONS}" \
+		-v run_typed="${RUN_TYPED_SQL}" \
+		-v run_records="${RUN_RECORDS_SQL}" \
+		-d "${DBNAME}" \
+		-f "${SQL_FILE}" | tee -a "${OUT}"
+done

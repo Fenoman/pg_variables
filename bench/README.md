@@ -24,7 +24,8 @@ Useful knobs:
 ```bash
 ITERATIONS=10000000 \
 TEXT_ITERATIONS=5000000 \
-RECORD_ITERATIONS=100 \
+RECORD_ITERATIONS=10000 \
+REPEATS=3 \
 RUN_TYPED=1 \
 RUN_RECORDS=1 \
 DBNAME=pgvbench \
@@ -36,6 +37,38 @@ When local authentication requires another OS user, pass a `psql` command:
 ```bash
 PSQL="sudo -u postgres psql" DBNAME=pgvbench ./bench/run_hot_paths.sh
 ```
+
+Each run starts with a `baseline count(g)` line (the `generate_series` + `count`
+overhead with no `pgv_*` call) to subtract from the per-op timings. The whole
+run repeats `REPEATS` times under a git-rev/version header, so compare the median
+across runs rather than a single number.
+
+## Per-transaction Throughput (pgbench)
+
+`hot_paths.sql` loops inside one statement, so it never pays the per-commit cost
+of transactional variables (`prepareChangesStack`, `processChanges` and
+`ModuleContext` teardown run once per whole run). `bench/run_pgbench.sh` closes
+that gap: every scenario in `bench/pgbench/` is one transaction driven by
+`pgbench`, so the commit-time discard path is measured.
+
+```bash
+DBNAME=pgvbench ./bench/run_pgbench.sh
+# knobs: TXNS (default 200000), CLIENTS (1), REPEATS (5), PGBENCH, PSQL
+```
+
+Scenarios (median tps over `REPEATS` runs, baseline first):
+
+- `baseline` — `SELECT 1;` (round-trip floor; subtract from the rest)
+- `set_reg`  — `pgv_set(..., false)` (regular set, no changesStack)
+- `set_tx`   — `pgv_set(..., true)` (transactional set: full per-commit discard)
+- `tx_block` — `BEGIN; 4x pgv_set(..., true); COMMIT;` (discard amortised over N sets)
+
+Reads are covered by the in-statement `hot_paths.sql` instead: a pgbench read
+scenario is not meaningful here because pg_variables state is backend-local, so
+a variable can only be read from the same connection that set it.
+
+The gap between `set_reg` and `set_tx` is the per-commit transactional overhead;
+`tx_block` shows how it amortises when several sets share one commit.
 
 The output is stored under `bench/results/` and ignored by git.
 

@@ -17,11 +17,14 @@ DBNAME="${DBNAME:-pgvbench}"
 PSQL="${PSQL:-psql}"
 SUDO="${SUDO:-sudo}"
 
-ITERATIONS="${ITERATIONS:-100000000}"
-TEXT_ITERATIONS="${TEXT_ITERATIONS:-50000000}"
+ITERATIONS="${ITERATIONS:-10000000}"
+TEXT_ITERATIONS="${TEXT_ITERATIONS:-5000000}"
 PERF_SECONDS="${PERF_SECONDS:-8}"
 PERF_FREQ="${PERF_FREQ:-999}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-2}"
+# dwarf unwinding does not need frame pointers, which PostgreSQL builds usually
+# omit; fp call graphs come out truncated.
+PERF_CALLGRAPH="${PERF_CALLGRAPH:-dwarf}"
 
 mkdir -p "${RESULTS_DIR}"
 chmod 0777 "${RESULTS_DIR}"
@@ -78,7 +81,7 @@ SQL
 
 	${SUDO} perf record \
 		-F "${PERF_FREQ}" \
-		-g --call-graph fp \
+		-g --call-graph "${PERF_CALLGRAPH}" \
 		-p "${backend_pid}" \
 		-o "${RESULTS_DIR}/${name}.data" \
 		-- sleep "${PERF_SECONDS}" \

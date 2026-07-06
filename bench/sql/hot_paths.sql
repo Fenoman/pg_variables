@@ -6,12 +6,22 @@ SET jit = off;
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_variables;
 
+\echo === provenance ===
+SELECT current_setting('server_version') AS server_version,
+       :iterations AS iterations, :text_iterations AS text_iterations,
+       :record_iterations AS record_iterations;
+
 \timing on
 
 \echo === setup ===
 SELECT pgv_free();
 SELECT pgv_set('bench_scalar', 'int_value', 0);
 SELECT pgv_set('bench_scalar', 'text_value', repeat('x', 32));
+
+\echo === baseline (generate_series + count, no pgv call) ===
+\echo baseline count(g)
+SELECT count(g)
+FROM (SELECT generate_series(1, :iterations) AS g) AS s;
 
 \echo === generic scalar hot paths ===
 \echo pgv_set int
