@@ -3099,6 +3099,22 @@ processChanges(Action action, bool sub)
 	ChangesStackNode *bottom_list;
 
 	Assert(changesStack && changesStackContext);
+
+	/*
+	 * Re-entrancy guard. If a previous processChanges() was interrupted by an
+	 * error after it had already popped the bottom node -- leaving an empty but
+	 * non-NULL stack -- the following XACT_EVENT_ABORT re-enters here. There is
+	 * nothing left to apply, and popping an empty list would dereference its
+	 * header as a node, so discard the spent stack and return.
+	 */
+	if (dlist_is_empty(changesStack))
+	{
+		MemoryContextDelete(changesStackContext);
+		changesStack = NULL;
+		changesStackContext = NULL;
+		return;
+	}
+
 	/* List removed from stack but we still can use it */
 	bottom_list = dlist_container(ChangesStackNode, node,
 								  dlist_pop_head_node(changesStack));
