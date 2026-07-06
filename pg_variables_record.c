@@ -177,6 +177,10 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 	fmgr_info(typentry->hash_proc_finfo.fn_oid, &record->hash_proc);
 	fmgr_info(typentry->cmp_proc_finfo.fn_oid, &record->cmp_proc);
 
+	/* No rowtype has been validated for the fast path yet. */
+	record->last_checked_typeid = InvalidOid;
+	record->last_checked_typmod = -1;
+
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -288,8 +292,13 @@ coerce_unknown_first_record(TupleDesc *tupdesc, HeapTupleHeader *rec)
 
 /*
  * New record structure should be the same as the first record.
+ *
+ * Returns true if the input tuple carried UNKNOWN columns that had to be
+ * coerced (i.e. the tuple was reconstructed); false if it matched as-is. The
+ * caller uses this to decide whether the rowtype is safe to cache for the fast
+ * path, which does not run reconstruct_tuple().
  */
-void
+bool
 check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc tupdesc)
 {
 	int			i;
@@ -336,6 +345,8 @@ check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc tupdesc)
 
 	if (unknowns)
 		reconstruct_tuple(tupdesc, record->tupdesc, rec);
+
+	return unknowns;
 }
 
 /*

@@ -1096,6 +1096,28 @@ variable_insert(PG_FUNCTION_ARGS)
 	tupTypmod = HeapTupleHeaderGetTypMod(rec);
 
 	record = &(GetActualValue(variable).record);
+
+	/*
+	 * Fast path: a non-first record whose rowtype exactly matches the last one
+	 * validated for this variable state needs neither a tuple-descriptor lookup
+	 * nor an attribute re-check. Only anonymous RECORD types are cached, and
+	 * their typmod is immutable within the backend, so the stored structure is
+	 * guaranteed identical and no UNKNOWN coercion is required. insert_record()
+	 * uses record->tupdesc, so the input descriptor is not needed here.
+	 */
+	if (record->tupdesc && !variable->is_deleted &&
+		tupType == RECORDOID &&
+		tupType == record->last_checked_typeid &&
+		tupTypmod == record->last_checked_typmod)
+	{
+		insert_record(variable, rec);
+
+		PG_FREE_IF_COPY(package_name, 0);
+		PG_FREE_IF_COPY(var_name, 1);
+
+		PG_RETURN_VOID();
+	}
+
 	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
 
 	if (!record->tupdesc || variable->is_deleted)
@@ -1129,8 +1151,21 @@ variable_insert(PG_FUNCTION_ARGS)
 		 * Also we convert UNKNOWNOID to TEXTOID if needed.
 		 * tupdesc may be changed
 		 */
-		check_attributes(variable, &rec, tupdesc);
+		bool		coerced = check_attributes(variable, &rec, tupdesc);
 
+		/*
+		 * Cache this rowtype for the fast path only when it is an anonymous
+		 * RECORD (named composites can change structure under a stable OID via
+		 * ALTER TYPE) and needed no UNKNOWN coercion (the fast path does not run
+		 * reconstruct_tuple()). Otherwise drop any stale cached type.
+		 */
+		if (!coerced && tupType == RECORDOID)
+		{
+			record->last_checked_typeid = tupType;
+			record->last_checked_typmod = tupTypmod;
+		}
+		else
+			record->last_checked_typeid = InvalidOid;
 	}
 
 	insert_record(variable, rec);
@@ -1195,7 +1230,7 @@ variable_update(PG_FUNCTION_ARGS)
 	 * Convert UNKNOWNOID to TEXTOID if needed
 	 * tupdesc may be changed
 	 */
-	check_attributes(variable, &rec, tupdesc);
+	(void) check_attributes(variable, &rec, tupdesc);
 	ReleaseTupleDesc(tupdesc);
 
 	res = update_record(variable, rec);

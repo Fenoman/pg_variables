@@ -43,6 +43,15 @@ typedef struct RecordVar
 	FmgrInfo	hash_proc;
 	/* Match function info */
 	FmgrInfo	cmp_proc;
+	/*
+	 * Cache of the last input rowtype that check_attributes() accepted without
+	 * UNKNOWN coercion. Only anonymous RECORD types are cached: their (RECORDOID,
+	 * typmod) pair is immutable within the backend, so a match guarantees the
+	 * same structure and lets a bulk pgv_insert() skip lookup_rowtype_tupdesc()
+	 * and check_attributes(). InvalidOid means "no cached type".
+	 */
+	Oid			last_checked_typeid;
+	int32		last_checked_typmod;
 } RecordVar;
 
 typedef struct ScalarVar
@@ -185,7 +194,7 @@ typedef struct ChangesStackNode
 extern bool convert_unknownoid;
 
 extern void init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable);
-extern void check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc tupdesc);
+extern bool check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc tupdesc);
 extern void coerce_unknown_first_record(TupleDesc *tupdesc, HeapTupleHeader * rec);
 extern void check_record_key(Variable *variable, Oid typid);
 

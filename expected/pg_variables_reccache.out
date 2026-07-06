@@ -1,0 +1,117 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- pgv_insert() caches the last validated input rowtype so that a bulk insert of
+-- identical records can skip the per-row tuple-descriptor lookup and attribute
+-- check. These tests pin the behavior that must stay identical with or without
+-- that cache: every structural check still fires, duplicate keys are still
+-- rejected, and UNKNOWN literals are still coerced on every row.
+-- Bulk insert of one anonymous rowtype: all rows land.
+SELECT count(*) FROM (SELECT pgv_insert('p','r', row(g, 'v'||g)) FROM generate_series(1,5) g) t;
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) AS stored FROM pgv_select('p','r') AS x(k int, v text);
+ stored 
+--------
+      5
+(1 row)
+
+-- One more of the same structure (fast path), then a duplicate key: rejected.
+SELECT pgv_insert('p','r', row(6, 'v6'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('p','r', row(6, 'dup'::text));
+ERROR:  there is a record in the variable "r" with same key
+-- A mismatching structure is still rejected even after the type was cached.
+SELECT pgv_insert('p','r', row(7, 8));
+ERROR:  new record attribute type for attribute number 2 differs from variable "r" structure.
+HINT:  You may need explicit type casts.
+SELECT pgv_insert('p','r', row(9, 'x'::text, 10));
+ERROR:  new record structure have 3 attributes, but variable "r" structure have 2.
+-- The good structure still inserts afterwards.
+SELECT pgv_insert('p','r', row(7, 'v7'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT k, v FROM pgv_select('p','r') AS x(k int, v text) ORDER BY k;
+ k | v  
+---+----
+ 1 | v1
+ 2 | v2
+ 3 | v3
+ 4 | v4
+ 5 | v5
+ 6 | v6
+ 7 | v7
+(7 rows)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- UNKNOWN literals must be coerced to text on every row; the fast path must not
+-- skip that coercion.
+SELECT count(*) FROM (SELECT pgv_insert('u','r', row(g, 'lit')) FROM generate_series(1,4) g) t;
+ count 
+-------
+     4
+(1 row)
+
+SELECT k, v FROM pgv_select('u','r') AS x(k int, v text) ORDER BY k;
+ k |  v  
+---+-----
+ 1 | lit
+ 2 | lit
+ 3 | lit
+ 4 | lit
+(4 rows)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Interleaving a second, incompatible rowtype must not be masked by the cache;
+-- switching back to the first rowtype must still work.
+SELECT pgv_insert('m','r', row(1, 'a'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('m','r', row(2, 2));
+ERROR:  new record attribute type for attribute number 2 differs from variable "r" structure.
+HINT:  You may need explicit type casts.
+SELECT pgv_insert('m','r', row(3, 'c'::text));
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT k, v FROM pgv_select('m','r') AS x(k int, v text) ORDER BY k;
+ k | v 
+---+---
+ 1 | a
+ 3 | c
+(2 rows)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
