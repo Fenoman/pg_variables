@@ -2410,11 +2410,24 @@ createVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 
 	/*
 	 * If the variable has been created or has just become valid, increment
-	 * the counter of valid transactional variables.
+	 * the counter of valid transactional variables. This mutates package
+	 * state, so the package needs a savepoint at the current transaction level
+	 * first. The new-variable branch above created one, but a revalidated
+	 * variable (found && !is_valid) reaches here without it, and the fast
+	 * package-lookup path skips createPackage(); without a package savepoint a
+	 * ROLLBACK TO could not restore trans_var_num and would leave a phantom
+	 * package.
 	 */
 	if (is_transactional &&
 		(!found || !GetActualState(variable)->is_valid))
+	{
+		if (!isObjectChangedInCurrentTrans(&package->transObject))
+		{
+			createSavepoint(&package->transObject, TRANS_PACKAGE);
+			addToChangesStack(&package->transObject, TRANS_PACKAGE);
+		}
 		GetPackState(package)->trans_var_num++;
+	}
 	GetActualState(variable)->is_valid = true;
 
 	/* If it is necessary, put variable to changedVars */
