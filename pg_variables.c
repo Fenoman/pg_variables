@@ -832,16 +832,18 @@ variable_set(text *package_name, text *var_name,
 		bool		old_is_byref = (!scalar->typbyval && !scalar->is_null);
 		Datum		old_value = scalar->value;
 
-		scalar->is_null = is_null;
-
 		if (is_null)
 		{
 			if (old_is_byref)
 				pfree(DatumGetPointer(old_value));
 			scalar->value = 0;
+			scalar->is_null = true;
 		}
 		else if (scalar->typbyval)
+		{
 			scalar->value = value;
+			scalar->is_null = false;
+		}
 		else
 		{
 			MemoryContext oldcxt;
@@ -882,14 +884,26 @@ variable_set(text *package_name, text *var_name,
 			}
 			else
 			{
-				if (old_is_byref)
-					pfree(DatumGetPointer(old_value));
+				Datum		new_value;
 
+				/*
+				 * Compute the copy before mutating the variable: datumCopy() can
+				 * raise on OOM, so producing the new value first -- and freeing
+				 * the old one only once it succeeds -- leaves scalar->value and
+				 * scalar->is_null describing the still-valid old value on
+				 * failure, instead of a freed buffer or a false is_null.
+				 */
 				valuecontext = pack_hctx(package, is_transactional);
 				oldcxt = MemoryContextSwitchTo(valuecontext);
-				scalar->value = datumCopy(value, false, scalar->typlen);
+				new_value = datumCopy(value, false, scalar->typlen);
 				MemoryContextSwitchTo(oldcxt);
+
+				if (old_is_byref)
+					pfree(DatumGetPointer(old_value));
+				scalar->value = new_value;
 			}
+
+			scalar->is_null = false;
 		}
 	}
 }
