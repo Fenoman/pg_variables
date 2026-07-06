@@ -44,12 +44,44 @@ variables. If the package becomes empty, it is automatically deleted.
 
 ## Configuration
 
+The module registers two configuration parameters.
+
+`pg_variables.convert_unknownoid` makes record values of the internal `unknown`
+type (for example, untyped string literals passed to `pgv_insert()`) be stored
+as `text`. It is enabled by default.
+
 `pg_variables.unlock_advisory_locks_on_abort` controls cleanup of session-level
 advisory locks on transaction abort. It is enabled by default. When enabled,
 the backend releases all session-level advisory locks on a top-level transaction
 abort or rollback, using the same lock manager path as
 `pg_advisory_unlock_all()`. `COMMIT` and `ROLLBACK TO SAVEPOINT` keep regular
 PostgreSQL behavior.
+
+Both parameters take effect only in backends where the pg_variables library is
+loaded. The library is loaded lazily on the first `pgv_*` call in a backend, so
+a backend that has not used pg_variables yet does not release advisory locks on
+abort even when the GUC is enabled. Add pg_variables to
+`shared_preload_libraries` if you need the advisory-lock cleanup to apply
+unconditionally to every backend.
+
+## Upgrade notes
+
+Version 1.4.0 makes transactional variables strictly transaction-local (see the
+`is_transactional` behavior below). This is a behavior change from earlier
+versions, where a transactional variable could outlive its transaction.
+
+`pg_dump` does not record an extension version, so restoring a dump taken from an
+older catalog (1.0/1.1/1.2/1.3) always recreates the extension at 1.4.0. The
+restore itself is clean, but any application that relied on a transactional
+variable surviving `COMMIT` observes the new discard-on-commit semantics after
+the restore, without any error or warning. Review such code before migrating.
+
+`ALTER EXTENSION pg_variables UPDATE` from 1.0 drops the old two-column
+`pgv_list()` and the 3-argument setters; from a PostgresPro 1.3 catalog it also
+drops the collection API (`pgv_count`, `pgv_first`, `pgv_last`, `pgv_next`,
+`pgv_prior`, `pgv_get_elem`, and related functions). If your own views or
+functions depend on any of these, the update aborts with a dependency error;
+drop those objects first and recreate them after the update.
 
 ## License
 
@@ -234,7 +266,7 @@ SELECT pgv_get('vars', 'int1', NULL::int);
 -------------
          101
 
-SELECT SELECT pgv_get('vars', 'text1', NULL::text);
+SELECT pgv_get('vars', 'text1', NULL::text);
     pgv_get
 ---------------
  text variable
@@ -325,17 +357,18 @@ SELECT pgv_free();
 If you want variables with support of transactions and savepoints, you should
 add flag `is_transactional = true` as the last argument in functions `pgv_set()`
 or `pgv_insert()`. Transactional variables are local to the current top-level
-transaction, including standalone autocommit statements: at top-level `COMMIT`,
-new variables disappear and changes to existing variables are reverted to the
-state that existed before the transaction. Non-transactional variables are not
-affected by this rule.
+transaction, including standalone autocommit statements. A transactional
+variable never survives its top-level transaction: at top-level `COMMIT` or
+`ROLLBACK`, every transactional variable created or changed in that transaction
+is discarded. `SAVEPOINT` and `ROLLBACK TO SAVEPOINT` behave as usual within the
+transaction. Non-transactional variables are not affected by this rule.
 
 Explicit `pgv_remove(package)` inside an explicit transaction block remains
 effective after `COMMIT`: the whole package is removed, including its
 non-transactional variables.  Removing a single transactional variable with
-`pgv_remove(package, name)` inside an explicit transaction block follows the
-transaction-local rule: after `COMMIT`, the variable is restored to the state
-that existed before `BEGIN`.
+`pgv_remove(package, name)` follows the transaction-local rule as well: the
+variable is discarded together with the transaction and does not reappear after
+`COMMIT`.
 
 PostgreSQL materializes holdable cursors before transaction end.  Therefore, a
 `DECLARE CURSOR WITH HOLD` query over transaction-local variables can still fetch
@@ -369,7 +402,9 @@ ERROR:  unrecognized package "pack"
 ```
 
 If you create a transactional variable after `BEGIN` or `SAVEPOINT` statements
-and then rollback to previous state - variable will not be exist:
+and then roll back to a previous state, the variable no longer exists.  Here it
+is the only variable of package `pack`, so rolling back past its creation also
+removes the now-empty package:
 
 ```sql
 BEGIN;
@@ -384,7 +419,7 @@ pgv_get
 
 ROLLBACK TO sp1;
 SELECT pgv_get('pack','var_int', NULL::int);
-ERROR:  unrecognized variable "var_int"
+ERROR:  unrecognized package "pack"
 COMMIT;
 ```
 
@@ -410,16 +445,21 @@ SELECT * FROM pgv_list();
 COMMIT;
 ```
 
-If you created transactional variable once, you should use flag `is_transactional`
-every time when you want to change variable value by functions `pgv_set()`,
-`pgv_insert()` and deprecated setters (i.e. `pgv_set_int()`). If you try to
-change this option, you'll get an error:
+Once a variable has been created as transactional, you must pass the
+`is_transactional` flag on every change made through `pgv_set()`, `pgv_insert()`
+and the deprecated setters (i.e. `pgv_set_int()`) within the same transaction;
+if you try to change this option, you'll get an error. The example has to run
+inside one transaction block, because a transactional variable does not survive
+its top-level transaction — in autocommit mode the first statement would be
+discarded before the second one runs:
 
 ```sql
+BEGIN;
 SELECT pgv_insert('pack', 'var_record', row(123::int, 'text'::text), true);
 
 SELECT pgv_insert('pack', 'var_record', row(456::int, 'another text'::text));
 ERROR:  variable "var_record" already created as TRANSACTIONAL
+ROLLBACK;
 ```
 
 Functions `pgv_update()` and `pgv_delete()` do not require this flag.
