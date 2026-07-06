@@ -1,0 +1,105 @@
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Coverage for transaction-boundary paths of the discard semantics that were
+-- previously untested: WITH HOLD cursors, COMMIT AND CHAIN, and a COMMIT inside
+-- a PL/pgSQL procedure.
+-- WITH HOLD cursor over pgv_select(): the set-returning function is
+-- materialised at commit, so the cursor keeps returning its rows afterwards.
+SELECT pgv_insert('cov', 'r', ROW (1::int, 'a'::text), false);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_insert('cov', 'r', ROW (2::int, 'b'::text), false);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+BEGIN;
+DECLARE ch CURSOR WITH HOLD FOR
+    SELECT id, val FROM pgv_select('cov', 'r') AS t(id int, val text) ORDER BY id;
+COMMIT;
+FETCH ALL FROM ch;
+ id | val 
+----+-----
+  1 | a
+  2 | b
+(2 rows)
+
+CLOSE ch;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- COMMIT AND CHAIN ends the transaction (discarding transactional variables)
+-- and immediately starts a new one; the regular variable survives.
+BEGIN;
+SELECT pgv_set('cov2', 'reg', 5);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('cov2', 'tx', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+COMMIT AND CHAIN;
+SELECT pgv_exists('cov2', 'tx') AS tx_after_chain;
+ tx_after_chain 
+----------------
+ f
+(1 row)
+
+SELECT pgv_get('cov2', 'reg', NULL::int) AS reg_after_chain;
+ reg_after_chain 
+-----------------
+               5
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- A COMMIT inside a PL/pgSQL procedure discards the transactional variable set
+-- before it, while the regular variable persists.
+CREATE PROCEDURE pgv_cov_proc() LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pgv_set('cov3', 'tx', 7, true);
+    PERFORM pgv_set('cov3', 'reg', 8, false);
+    COMMIT;
+END;
+$$;
+CALL pgv_cov_proc();
+SELECT pgv_exists('cov3', 'tx') AS tx_after_proc;
+ tx_after_proc 
+---------------
+ f
+(1 row)
+
+SELECT pgv_get('cov3', 'reg', NULL::int) AS reg_after_proc;
+ reg_after_proc 
+----------------
+              8
+(1 row)
+
+DROP PROCEDURE pgv_cov_proc();
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

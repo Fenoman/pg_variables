@@ -3411,6 +3411,13 @@ pgvSubTransCallback(SubXactEvent event, SubTransactionId mySubid,
 				break;
 			case SUBXACT_EVENT_PRE_COMMIT_SUB:
 				break;
+			default:
+				/*
+				 * Ignore any other subtransaction events. Tantor SE adds
+				 * SUBXACT_EVENT_PRE_ABORT_SUB to the enum; there is nothing to
+				 * do for it here, and the default keeps the build warning-free.
+				 */
+				break;
 		}
 	}
 
