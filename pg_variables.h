@@ -195,6 +195,7 @@ extern bool delete_record(Variable *variable, Datum value, bool is_null);
 extern void insert_record_copy(RecordVar *dest_record, Datum src_tuple,
 							   Variable *variable);
 extern bool removeObject(TransObject *object, TransObjectType type);
+extern void removeVariable(Variable *variable);
 
 #define GetActualState(object) \
 	(dlist_head_element(TransState, node, &((TransObject *) object)->states))

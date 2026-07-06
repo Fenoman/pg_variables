@@ -104,8 +104,13 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 	 */
 	if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
 	{
-		/* At this point variable is just created, so we simply remove it. */
-		removeObject(&variable->transObject, TRANS_VARIABLE);
+		/*
+		 * The variable was just created. Unwind it through removeVariable() so
+		 * that a transactional variable already registered in changesStack is
+		 * invalidated in place rather than physically removed, which would
+		 * leave a dangling ChangedObject and crash the backend at commit.
+		 */
+		removeVariable(variable);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("could not identify a hash function for type %s",
@@ -114,7 +119,7 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 
 	if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
 	{
-		removeObject(&variable->transObject, TRANS_VARIABLE);
+		removeVariable(variable);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("could not identify a matching function for type %s",

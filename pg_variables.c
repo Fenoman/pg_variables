@@ -1579,33 +1579,27 @@ package_exists(PG_FUNCTION_ARGS)
 }
 
 /*
- * Remove variable from package by name.
+ * Remove a variable honouring transactional semantics.
+ *
+ * A transactional variable may already be referenced by changesStack, so it is
+ * invalidated in place and its physical removal is deferred to the stack
+ * machinery; deleting it from the hash table here would leave a dangling
+ * ChangedObject that turns into a wild pointer once the freed entry is reused.
+ * A regular variable is not tracked in changesStack and is removed outright.
  */
-Datum
-remove_variable(PG_FUNCTION_ARGS)
+void
+removeVariable(Variable *variable)
 {
-	text	   *package_name;
-	text	   *var_name;
-	Package    *package;
-	Variable   *variable;
-	TransObject *transObject;
+	Package    *package = variable->package;
+	TransObject *transObject = &variable->transObject;
 
-	CHECK_ARGS_FOR_NULL();
-
-	package_name = PG_GETARG_TEXT_PP(0);
-	var_name = PG_GETARG_TEXT_PP(1);
-
-	package = getCachedPackage(package_name, true);
-	variable = getCachedVariable(package, var_name, InvalidOid, false, true);
-
-	/* Add package to changes list, so we can remove it if it is empty */
+	/* Add package to changes list, so we can remove it if it becomes empty */
 	if (!isObjectChangedInCurrentTrans(&package->transObject))
 	{
 		createSavepoint(&package->transObject, TRANS_PACKAGE);
 		addToChangesStack(&package->transObject, TRANS_PACKAGE);
 	}
 
-	transObject = &variable->transObject;
 	if (variable->is_transactional)
 	{
 		if (!isObjectChangedInCurrentTrans(transObject))
@@ -1621,9 +1615,31 @@ remove_variable(PG_FUNCTION_ARGS)
 			GetActualState(package)->is_valid = false;
 	}
 	else
-		removeObject(&variable->transObject, TRANS_VARIABLE);
+		removeObject(transObject, TRANS_VARIABLE);
 
 	resetVariablesCache();
+}
+
+/*
+ * Remove variable from package by name.
+ */
+Datum
+remove_variable(PG_FUNCTION_ARGS)
+{
+	text	   *package_name;
+	text	   *var_name;
+	Package    *package;
+	Variable   *variable;
+
+	CHECK_ARGS_FOR_NULL();
+
+	package_name = PG_GETARG_TEXT_PP(0);
+	var_name = PG_GETARG_TEXT_PP(1);
+
+	package = getCachedPackage(package_name, true);
+	variable = getCachedVariable(package, var_name, InvalidOid, false, true);
+
+	removeVariable(variable);
 
 	PG_FREE_IF_COPY(package_name, 0);
 	PG_FREE_IF_COPY(var_name, 1);
