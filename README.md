@@ -44,25 +44,11 @@ variables. If the package becomes empty, it is automatically deleted.
 
 ## Configuration
 
-The module registers two configuration parameters.
+The module registers one configuration parameter.
 
 `pg_variables.convert_unknownoid` makes record values of the internal `unknown`
 type (for example, untyped string literals passed to `pgv_insert()`) be stored
 as `text`. It is enabled by default.
-
-`pg_variables.unlock_advisory_locks_on_abort` controls cleanup of session-level
-advisory locks on transaction abort. It is enabled by default. When enabled,
-the backend releases all session-level advisory locks on a top-level transaction
-abort or rollback, using the same lock manager path as
-`pg_advisory_unlock_all()`. `COMMIT` and `ROLLBACK TO SAVEPOINT` keep regular
-PostgreSQL behavior.
-
-Both parameters take effect only in backends where the pg_variables library is
-loaded. The library is loaded lazily on the first `pgv_*` call in a backend, so
-a backend that has not used pg_variables yet does not release advisory locks on
-abort even when the GUC is enabled. Add pg_variables to
-`shared_preload_libraries` if you need the advisory-lock cleanup to apply
-unconditionally to every backend.
 
 ## Upgrade notes
 

@@ -28,7 +28,6 @@
 #endif
 #include "catalog/pg_type.h"
 #include "parser/scansup.h"
-#include "storage/lock.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -101,7 +100,6 @@ static void addToChangesStackUpperLevel(TransObject *object,
 										TransObjectType type);
 static void pushChangesStack(void);
 static bool shouldDiscardTransactionalOnCommit(void);
-static void unlockAdvisoryLocksOnAbort(XactEvent event);
 
 static int	numOfRegVars(Package *package);
 
@@ -144,7 +142,6 @@ do { \
 
 /* User controlled GUCs */
 bool convert_unknownoid;
-static bool unlock_advisory_locks_on_abort;
 
 static HTAB *packagesHash = NULL;
 static MemoryContext ModuleContext = NULL;
@@ -3282,23 +3279,6 @@ shouldDiscardTransactionalOnCommit(void)
 	return true;
 }
 
-static void
-unlockAdvisoryLocksOnAbort(XactEvent event)
-{
-	if (!unlock_advisory_locks_on_abort)
-		return;
-
-	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
-		return;
-
-#ifdef PGPRO_EE
-	if (getNestLevelATX() > 0)
-		return;
-#endif
-
-	LockReleaseSession(USER_LOCKMETHOD);
-}
-
 #ifdef PGPRO_EE
 /*
  * At the beginning of ATX store the pg_variables's env into
@@ -3556,8 +3536,6 @@ pgvTransCallback(XactEvent event, void *arg)
 		}
 	}
 
-	unlockAdvisoryLocksOnAbort(event);
-
 	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_ABORT)
 		freeStatsLists();
 
@@ -3699,19 +3677,6 @@ _PG_init(void)
 							 "Use \'TEXT\' format for all values of \'UNKNOWNOID\', default is true.",
 							 NULL,
 						     &convert_unknownoid,
-							 true,
-							 PGC_USERSET,
-							 0, /* FLAGS??? */
-							 NULL,
-							 NULL,
-							 NULL);
-
-	DefineCustomBoolVariable("pg_variables.unlock_advisory_locks_on_abort",
-							 "Release session-level advisory locks on transaction abort.",
-							 "When enabled, pg_variables releases all session-level advisory locks "
-							 "held by the backend after a top-level transaction abort. Commit and "
-							 "subtransaction rollback keep regular PostgreSQL behavior.",
-						     &unlock_advisory_locks_on_abort,
 							 true,
 							 PGC_USERSET,
 							 0, /* FLAGS??? */
