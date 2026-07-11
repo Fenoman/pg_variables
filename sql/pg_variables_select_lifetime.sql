@@ -13,3 +13,36 @@ SELECT pgv_select('sel', 'r', 1::int) AS rec_value,
 -- The update is visible to a fresh select.
 SELECT pgv_select('sel', 'r', 1::int) AS rec_after_update;
 SELECT pgv_free();
+
+-- Updating a record with a by-reference key must move the hash entry's stored
+-- key pointer to the new tuple. Reusing the freed old tuple for another row
+-- must not make the updated row disappear from keyed lookup.
+SELECT pgv_insert('sel_text_key', 'r',
+                  ROW ('aaaa'::text, 'old-value'::text), false);
+SELECT pgv_update('sel_text_key', 'r',
+                  ROW ('aaaa'::text, 'new-value'::text));
+SELECT pgv_insert('sel_text_key', 'r',
+                  ROW ('bbbb'::text, 'other-val'::text), false);
+SELECT ROW (k, v) IS NOT DISTINCT FROM
+       ROW ('aaaa'::text, 'new-value'::text) AS text_key_still_indexed
+FROM pgv_select('sel_text_key', 'r', 'aaaa'::text) AS t(k text, v text);
+
+-- Fixed-length pass-by-reference keys, notably UUID, have the same lifetime
+-- requirement as varlena keys.
+SELECT pgv_insert('sel_uuid_key', 'r',
+                  ROW ('00000000-0000-0000-0000-000000000001'::uuid,
+                       'old-value'::text), false);
+SELECT pgv_update('sel_uuid_key', 'r',
+                  ROW ('00000000-0000-0000-0000-000000000001'::uuid,
+                       'new-value'::text));
+SELECT pgv_insert('sel_uuid_key', 'r',
+                  ROW ('00000000-0000-0000-0000-000000000002'::uuid,
+                       'other-val'::text), false);
+SELECT ROW (k, v) IS NOT DISTINCT FROM
+       ROW ('00000000-0000-0000-0000-000000000001'::uuid,
+            'new-value'::text) AS uuid_key_still_indexed
+FROM pgv_select('sel_uuid_key', 'r',
+                '00000000-0000-0000-0000-000000000001'::uuid)
+     AS t(k uuid, v text);
+SELECT pgv_free();
+-- End record-key lifetime checks.

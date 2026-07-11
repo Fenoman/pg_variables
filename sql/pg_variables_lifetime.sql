@@ -1,5 +1,49 @@
 SELECT pgv_free();
 
+-- Removing a package must release every VarState allocated for variables in
+-- that package. Keep another package alive so ModuleContext itself cannot hide
+-- the leak by being deleted. pg_backend_memory_contexts is unavailable on some
+-- supported old PostgreSQL versions, where this assertion is skipped.
+DO $$
+DECLARE
+    before_used bigint;
+    after_used bigint;
+    cycle_no integer;
+    variable_no integer;
+BEGIN
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NULL THEN
+        RETURN;
+    END IF;
+
+    PERFORM pgv_set('memory_anchor', 'v', 1, false);
+    EXECUTE $query$
+        SELECT used_bytes
+        FROM pg_catalog.pg_backend_memory_contexts
+        WHERE name = 'pg_variables: main memory context'
+    $query$ INTO STRICT before_used;
+
+    FOR cycle_no IN 1..20 LOOP
+        FOR variable_no IN 1..250 LOOP
+            PERFORM pgv_set('memory_churn', 'v' || variable_no,
+                            variable_no, false);
+        END LOOP;
+        PERFORM pgv_remove('memory_churn');
+    END LOOP;
+
+    EXECUTE $query$
+        SELECT used_bytes
+        FROM pg_catalog.pg_backend_memory_contexts
+        WHERE name = 'pg_variables: main memory context'
+    $query$ INTO STRICT after_used;
+
+    IF after_used - before_used > 131072 THEN
+        RAISE EXCEPTION 'package removal retained variable states';
+    END IF;
+END
+$$;
+SELECT pgv_free();
+-- End package-state lifetime checks.
+
 -- Transactional variables created inside an explicit transaction must not
 -- leak into the session after COMMIT.
 BEGIN;
@@ -158,3 +202,4 @@ SELECT pgv_free();
 FETCH 1 FROM stats_cur;
 COMMIT;
 SELECT pgv_free();
+-- End lifetime checks.

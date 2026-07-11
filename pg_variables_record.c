@@ -519,6 +519,12 @@ update_record(Variable *variable, HeapTupleHeader tupleHeader)
 		return false;
 	}
 
+	/*
+	 * A pass-by-reference key stored in the hash entry points inside the old
+	 * tuple.  Rebind it to the replacement tuple before releasing that storage.
+	 */
+	item->key.value = value;
+
 	/* Release old tuple */
 	pfree(DatumGetPointer(item->tuple));
 	item->tuple = tuple;

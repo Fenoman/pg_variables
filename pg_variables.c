@@ -2237,11 +2237,25 @@ initObjectHistory(TransObject *object, TransObjectType type)
 {
 	/* Initialize history */
 	TransState *state;
+	MemoryContext statecontext = ModuleContext;
 	int			size;
 
 	size = (type == TRANS_PACKAGE ? sizeof(PackState) : sizeof(VarState));
+	if (type == TRANS_VARIABLE)
+	{
+		Variable   *variable = (Variable *) object;
+
+		/*
+		 * A variable and all of its value storage are owned by the matching
+		 * package context. Keep the initial state there too, so bulk package
+		 * removal cannot leave an orphan VarState in ModuleContext.
+		 */
+		statecontext = pack_hctx(variable->package,
+							 variable->is_transactional);
+		Assert(statecontext != NULL);
+	}
 	dlist_init(&object->states);
-	state = MemoryContextAllocZero(ModuleContext, size);
+	state = MemoryContextAllocZero(statecontext, size);
 	dlist_push_head(&object->states, &(state->node));
 
 	/* Initialize state */
