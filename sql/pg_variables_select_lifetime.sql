@@ -46,3 +46,34 @@ FROM pgv_select('sel_uuid_key', 'r',
      AS t(k uuid, v text);
 SELECT pgv_free();
 -- End record-key lifetime checks.
+
+-- HASH_REMOVE invalidates its returned entry. Deleting a record must capture
+-- the separately allocated tuple before removing the hash entry, while the
+-- by-reference key still points into that tuple.
+SELECT pgv_insert('sel_delete_text', 'r',
+                  ROW ('text-key'::text, 'old'::text), false);
+SELECT pgv_delete('sel_delete_text', 'r', 'text-key'::text)
+       AS text_key_deleted;
+SELECT pgv_delete('sel_delete_text', 'r', 'text-key'::text)
+       AS text_key_missing;
+SELECT pgv_insert('sel_delete_text', 'r',
+                  ROW ('text-key'::text, 'new'::text), false);
+SELECT *
+FROM pgv_select('sel_delete_text', 'r', 'text-key'::text)
+     AS t(k text, v text);
+
+SELECT pgv_insert('sel_delete_uuid', 'r',
+                  ROW ('00000000-0000-0000-0000-000000000003'::uuid,
+                       'old'::text), false);
+SELECT pgv_delete('sel_delete_uuid', 'r',
+                  '00000000-0000-0000-0000-000000000003'::uuid)
+       AS uuid_key_deleted;
+SELECT pgv_insert('sel_delete_uuid', 'r',
+                  ROW ('00000000-0000-0000-0000-000000000003'::uuid,
+                       'new'::text), false);
+SELECT *
+FROM pgv_select('sel_delete_uuid', 'r',
+                '00000000-0000-0000-0000-000000000003'::uuid)
+     AS t(k uuid, v text);
+SELECT pgv_free();
+-- End delete lifetime checks.

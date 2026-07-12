@@ -9,10 +9,13 @@ PSQL="${PSQL:-psql}"
 
 ITERATIONS="${ITERATIONS:-10000000}"
 TEXT_ITERATIONS="${TEXT_ITERATIONS:-5000000}"
+FIXED_ITERATIONS="${FIXED_ITERATIONS:-5000000}"
 RECORD_ITERATIONS="${RECORD_ITERATIONS:-10000}"
+ARRAY_ITERATIONS="${ARRAY_ITERATIONS:-250000}"
 REPEATS="${REPEATS:-3}"
 RUN_TYPED="${RUN_TYPED:-1}"
 RUN_RECORDS="${RUN_RECORDS:-1}"
+RUN_ARRAYS="${RUN_ARRAYS:-1}"
 
 case "${RUN_TYPED}" in
 	1|true|on|yes) RUN_TYPED_SQL=true ;;
@@ -26,6 +29,12 @@ case "${RUN_RECORDS}" in
 	*) echo "RUN_RECORDS must be 0/1, true/false, on/off, or yes/no" >&2; exit 2 ;;
 esac
 
+case "${RUN_ARRAYS}" in
+	1|true|on|yes) RUN_ARRAYS_SQL=true ;;
+	0|false|off|no) RUN_ARRAYS_SQL=false ;;
+	*) echo "RUN_ARRAYS must be 0/1, true/false, on/off, or yes/no" >&2; exit 2 ;;
+esac
+
 mkdir -p "${RESULTS_DIR}"
 OUT="${RESULTS_DIR}/hot_paths_$(date +%Y%m%d_%H%M%S).out"
 
@@ -37,7 +46,7 @@ echo "Writing benchmark output to ${OUT}" >&2
 {
 	echo "# git:        ${GIT_REV}"
 	echo "# dbname:     ${DBNAME}"
-	echo "# iterations: ${ITERATIONS}  text: ${TEXT_ITERATIONS}  record: ${RECORD_ITERATIONS}"
+	echo "# iterations: ${ITERATIONS}  text: ${TEXT_ITERATIONS}  fixed: ${FIXED_ITERATIONS}  record: ${RECORD_ITERATIONS}  array: ${ARRAY_ITERATIONS}"
 	echo "# repeats:    ${REPEATS}   (compare the median across runs)"
 } | tee "${OUT}"
 
@@ -52,9 +61,12 @@ for run in $(seq 1 "${REPEATS}"); do
 	${PSQL} -X \
 		-v iterations="${ITERATIONS}" \
 		-v text_iterations="${TEXT_ITERATIONS}" \
+		-v fixed_iterations="${FIXED_ITERATIONS}" \
 		-v record_iterations="${RECORD_ITERATIONS}" \
+		-v array_iterations="${ARRAY_ITERATIONS}" \
 		-v run_typed="${RUN_TYPED_SQL}" \
 		-v run_records="${RUN_RECORDS_SQL}" \
+		-v run_arrays="${RUN_ARRAYS_SQL}" \
 		-d "${DBNAME}" \
 		-f "${SQL_FILE}" | tee -a "${OUT}"
 done

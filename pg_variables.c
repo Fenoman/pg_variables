@@ -853,21 +853,28 @@ variable_set(text *package_name, text *var_name,
 			 * such reference now, while preserving in-line compression, so the
 			 * copy kept in the package context is self-contained.
 			 */
-			if (scalar->typlen == -1)
+			if (scalar->typlen == -1 &&
+				VARATT_IS_EXTERNAL(DatumGetPointer(value)))
 				value = PointerGetDatum(detoast_external_attr(
 										(struct varlena *) DatumGetPointer(value)));
 
 			/*
-			 * Fast path: when the stored value and the new one are both inline
-			 * (neither external nor compressed) varlenas of the same total size,
-			 * overwrite the existing buffer in place instead of freeing it and
-			 * allocating a fresh copy. Rewriting a variable with a same-sized
-			 * value is a common pattern, and the stored buffer was allocated to
-			 * exactly VARSIZE_ANY() bytes, so the copy fits. Short (1-byte header)
-			 * values are plain inline data and are allowed; only external and
-			 * compressed forms are excluded.
+			 * Fixed-length pass-by-reference values always fit their existing
+			 * buffer.  Equal-sized inline varlenas can reuse theirs too, provided
+			 * neither value is external or compressed.  Short (1-byte header)
+			 * varlenas are plain inline data and are allowed.
 			 */
-			if (old_is_byref && scalar->typlen == -1 &&
+			if (old_is_byref && scalar->typlen > 0)
+			{
+				void	   *dst = DatumGetPointer(old_value);
+				void	   *src = DatumGetPointer(value);
+
+				/* Fixed-length values always fit the existing owned buffer. */
+				if (dst != src)
+					memcpy(dst, src, (Size) scalar->typlen);
+				scalar->value = old_value;
+			}
+			else if (old_is_byref && scalar->typlen == -1 &&
 				!VARATT_IS_EXTERNAL(DatumGetPointer(old_value)) &&
 				!VARATT_IS_COMPRESSED(DatumGetPointer(old_value)) &&
 				!VARATT_IS_EXTERNAL(DatumGetPointer(value)) &&
@@ -1492,7 +1499,6 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 	{
 		text	   *package_name;
 		text	   *var_name;
-		ArrayType  *arg_values;
 		ArrayType  *values;
 		Package    *package;
 		Variable   *variable;
@@ -1509,8 +1515,13 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("array argument can not be NULL")));
 
-		arg_values = PG_GETARG_ARRAYTYPE_P(2);
-		if (ARR_NDIM(arg_values) > 1)
+		/* Keep one flat copy alive for validation and all SRF calls. */
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		values = PG_GETARG_ARRAYTYPE_P_COPY(2);
+		MemoryContextSwitchTo(oldcontext);
+
+		if (ARR_NDIM(values) > 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("searching for elements in multidimensional arrays is not supported")));
@@ -1524,14 +1535,12 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 									 true);
 		record = &(GetActualValue(variable).record);
 
-		check_record_key(variable, ARR_ELEMTYPE(arg_values));
+		check_record_key(variable, ARR_ELEMTYPE(values));
 
-		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		funcctx->tuple_desc = record->tupdesc;
 
-		values = PG_GETARG_ARRAYTYPE_P_COPY(2);
 		var = (VariableIteratorRec *) palloc(sizeof(VariableIteratorRec));
 		var->iterator = array_create_iterator(values, 0, NULL);
 		var->record = record;
@@ -1559,7 +1568,6 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 										   &entry->callback);
 
 		MemoryContextSwitchTo(oldcontext);
-		PG_FREE_IF_COPY(arg_values, 2);
 		PG_FREE_IF_COPY(package_name, 0);
 		PG_FREE_IF_COPY(var_name, 1);
 	}
@@ -2320,6 +2328,18 @@ createPackage(text *name, bool is_trans)
 
 	/* Find or create a package entry */
 	package = (Package *) hash_search(packagesHash, key, HASH_ENTER, &found);
+
+	/*
+	 * Looking up an existing valid package does not change transactional
+	 * state.  Defer package savepoint/changesStack creation until a variable
+	 * operation actually changes the package.
+	 */
+	if (found && GetActualState(package)->is_valid)
+	{
+		if (!pack_htab(package, is_trans))
+			makePackHTAB(package, is_trans);
+		return package;
+	}
 
 	if (found)
 	{

@@ -25,3 +25,45 @@ ROLLBACK TO s;
 SELECT pgv_get('ip2', 'v', NULL::text) AS after_rollback;
 COMMIT;
 SELECT pgv_free();
+
+-- Fixed-length pass-by-reference values can reuse their stored buffer too.
+SELECT pgv_set('ip_fixed', 'uuid_value',
+               '00000000-0000-0000-0000-000000000001'::uuid);
+SELECT pgv_set('ip_fixed', 'uuid_value',
+               '00000000-0000-0000-0000-000000000002'::uuid);
+SELECT pgv_get('ip_fixed', 'uuid_value', NULL::uuid) AS uuid_value;
+
+SELECT pgv_set('ip_fixed', 'name_value', 'first-name'::name);
+SELECT pgv_set('ip_fixed', 'name_value', 'second-name'::name);
+SELECT pgv_get('ip_fixed', 'name_value', NULL::name) AS name_value;
+
+SELECT pgv_set('ip_fixed', 'interval_value', '1 day'::interval);
+SELECT pgv_set('ip_fixed', 'interval_value',
+               '2 days 03:04:05'::interval);
+SELECT pgv_get('ip_fixed', 'interval_value', NULL::interval)
+       AS interval_value;
+
+SELECT pgv_set('ip_fixed', 'tid_value', '(1,2)'::tid);
+SELECT pgv_set('ip_fixed', 'tid_value', '(3,4)'::tid);
+SELECT pgv_get('ip_fixed', 'tid_value', NULL::tid) AS tid_value;
+
+SELECT pgv_set('ip_fixed', 'uuid_value', NULL::uuid);
+SELECT pgv_get('ip_fixed', 'uuid_value', NULL::uuid, false) AS uuid_null;
+SELECT pgv_free();
+
+-- The current transactional state owns a distinct fixed-length buffer; an
+-- in-place overwrite must not modify the state restored by ROLLBACK TO.
+BEGIN;
+SELECT pgv_set('ip_fixed_tx', 'uuid_value',
+               '00000000-0000-0000-0000-000000000010'::uuid, true);
+SAVEPOINT fixed_sp;
+SELECT pgv_set('ip_fixed_tx', 'uuid_value',
+               '00000000-0000-0000-0000-000000000020'::uuid, true);
+SELECT pgv_get('ip_fixed_tx', 'uuid_value', NULL::uuid)
+       AS fixed_before_rollback;
+ROLLBACK TO fixed_sp;
+SELECT pgv_get('ip_fixed_tx', 'uuid_value', NULL::uuid)
+       AS fixed_after_rollback;
+ROLLBACK;
+SELECT pgv_free();
+-- End fixed-length in-place checks.

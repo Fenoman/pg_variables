@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Per-transaction throughput benchmark for the pg_variables hot paths.
+# Per-workload-iteration throughput benchmark for the pg_variables hot paths.
 #
 # Unlike bench/sql/hot_paths.sql (which loops inside a single statement and so
 # never exercises the per-commit changesStack/discard machinery), each pgbench
-# script here is one transaction, so the commit-time cost of transactional
-# variables is measured. Every scenario is run REPEATS times and the median tps
-# is reported next to the baseline (SELECT 1) so the extension's share is clear.
+# script is repeated as one pgbench transaction. Individual SQL statements use
+# autocommit unless the script contains an explicit BEGIN/COMMIT, as tx_block.sql
+# does. Every scenario is run REPEATS times and the median tps is reported next
+# to a statement-count-matched baseline so the extension's share is clear.
 #
 set -euo pipefail
 
@@ -27,6 +28,8 @@ REPEATS="${REPEATS:-5}"     # runs per scenario; the median is reported
 SCENARIOS=(
 	"baseline:baseline.sql"
 	"set_reg:set_reg.sql"
+	"baseline_4x:baseline_4x.sql"
+	"insert_reg:insert_reg.sql"
 	"set_tx:set_tx.sql"
 	"tx_block:tx_block.sql"
 )

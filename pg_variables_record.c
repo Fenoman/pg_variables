@@ -536,10 +536,12 @@ update_record(Variable *variable, HeapTupleHeader tupleHeader)
 bool
 delete_record(Variable *variable, Datum value, bool is_null)
 {
+	Datum		tuple;
 	HashRecordKey k;
 	HashRecordEntry *item;
 	bool		found;
 	RecordVar  *record;
+	uint32		hashvalue;
 
 	Assert(variable->typid == RECORDOID);
 
@@ -551,12 +553,21 @@ delete_record(Variable *variable, Datum value, bool is_null)
 	k.hash_proc = &record->hash_proc;
 	k.cmp_proc = &record->cmp_proc;
 
-	item = (HashRecordEntry *) hash_search(record->rhash, &k,
-										   HASH_REMOVE, &found);
-	if (found)
-		pfree(DatumGetPointer(item->tuple));
+	hashvalue = get_hash_value(record->rhash, &k);
+	item = (HashRecordEntry *) hash_search_with_hash_value(record->rhash, &k,
+														 hashvalue, HASH_FIND,
+														 &found);
+	if (!found)
+		return false;
 
-	return found;
+	/* HASH_REMOVE returns a dangling entry, so save its tuple beforehand. */
+	tuple = item->tuple;
+	(void) hash_search_with_hash_value(record->rhash, &k, hashvalue,
+									 HASH_REMOVE, &found);
+	Assert(found);
+	pfree(DatumGetPointer(tuple));
+
+	return true;
 }
 
 /*
