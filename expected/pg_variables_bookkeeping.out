@@ -192,3 +192,40 @@ SELECT pgv_free();
 (1 row)
 
 -- End package bookkeeping checks.
+-- Completed savepoints must release their own stack metadata, even when they
+-- contain no variable changes. A fixed depth must use bounded memory for both
+-- subcommit and subabort; warming up avoids testing AllocSet's initial growth.
+DO $$
+DECLARE
+    before_used bigint;
+    after_used bigint;
+    phase integer;
+    i integer;
+BEGIN
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NULL THEN
+        RETURN;
+    END IF;
+    PERFORM pgv_set('stack_churn', 'v', 1, true);
+    FOR phase IN 1..2 LOOP
+        FOR i IN 1..10000 LOOP
+            BEGIN
+                IF i % 2 = 0 THEN
+                    RAISE SQLSTATE 'ZX002';
+                END IF;
+            EXCEPTION WHEN SQLSTATE 'ZX002' THEN
+                NULL;
+            END;
+        END LOOP;
+        EXECUTE $query$
+            SELECT used_bytes
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: changesStack'
+        $query$ INTO STRICT after_used;
+        IF phase = 1 THEN
+            before_used := after_used;
+        ELSIF after_used - before_used > 65536 THEN
+            RAISE EXCEPTION 'completed savepoints retained stack metadata';
+        END IF;
+    END LOOP;
+END
+$$;

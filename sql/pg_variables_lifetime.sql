@@ -203,3 +203,110 @@ FETCH 1 FROM stats_cur;
 COMMIT;
 SELECT pgv_free();
 -- End lifetime checks.
+
+-- Package removal must not leave a record marked for reinitialization after
+-- rollback. Exercise both remove(package) and free(), including an inner
+-- subtransaction that releases its removal into the aborted outer block.
+DO $$
+DECLARE
+    clear_all boolean;
+    ids integer[];
+BEGIN
+    FOREACH clear_all IN ARRAY ARRAY[false, true] LOOP
+        PERFORM pgv_insert('rollback_package', 'r', ROW (1, 'a'::text), true);
+        PERFORM pgv_insert('rollback_package', 'other', ROW (10), true);
+        PERFORM pgv_set('rollback_package', 'regular', 1, false);
+
+        BEGIN
+            BEGIN
+                IF clear_all THEN
+                    PERFORM pgv_free();
+                ELSE
+                    PERFORM pgv_remove('rollback_package');
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                RAISE;
+            END;
+            RAISE SQLSTATE 'ZX001';
+        EXCEPTION WHEN SQLSTATE 'ZX001' THEN
+            NULL;
+        END;
+
+        IF pgv_exists('rollback_package', 'regular') THEN
+            RAISE EXCEPTION 'rollback restored a regular variable';
+        END IF;
+        PERFORM pgv_insert('rollback_package', 'r', ROW (2, 'b'::text), true);
+        SELECT array_agg(id ORDER BY id) INTO ids
+        FROM pgv_select('rollback_package', 'r') AS t(id int, val text);
+        IF ids IS DISTINCT FROM ARRAY[1, 2] THEN
+            RAISE EXCEPTION 'package rollback lost records: %', ids;
+        END IF;
+        PERFORM pgv_insert('rollback_package', 'other', ROW (11), true);
+        SELECT array_agg(id ORDER BY id) INTO ids
+        FROM pgv_select('rollback_package', 'other') AS t(id int);
+        IF ids IS DISTINCT FROM ARRAY[10, 11] THEN
+            RAISE EXCEPTION 'package rollback lost untouched records: %', ids;
+        END IF;
+
+        -- A recreated collection must not overwrite the rollback snapshot.
+        BEGIN
+            IF clear_all THEN
+                PERFORM pgv_free();
+            ELSE
+                PERFORM pgv_remove('rollback_package');
+            END IF;
+            PERFORM pgv_insert('rollback_package', 'r', ROW (99, 'new'::text), true);
+            RAISE SQLSTATE 'ZX001';
+        EXCEPTION WHEN SQLSTATE 'ZX001' THEN
+            NULL;
+        END;
+        PERFORM pgv_insert('rollback_package', 'r', ROW (3, 'c'::text), true);
+        SELECT array_agg(id ORDER BY id) INTO ids
+        FROM pgv_select('rollback_package', 'r') AS t(id int, val text);
+        IF ids IS DISTINCT FROM ARRAY[1, 2, 3] THEN
+            RAISE EXCEPTION 'recreation rollback lost records: %', ids;
+        END IF;
+        SELECT array_agg(id ORDER BY id) INTO ids
+        FROM pgv_select('rollback_package', 'other') AS t(id int);
+        IF ids IS DISTINCT FROM ARRAY[10, 11] THEN
+            RAISE EXCEPTION 'recreation rollback lost untouched records: %', ids;
+        END IF;
+
+        -- Recreating a removed package without a rollback must start empty.
+        PERFORM pgv_remove('rollback_package');
+        PERFORM pgv_insert('rollback_package', 'r', ROW (99, 'new'::text), true);
+        SELECT array_agg(id ORDER BY id) INTO ids
+        FROM pgv_select('rollback_package', 'r') AS t(id int, val text);
+        IF ids IS DISTINCT FROM ARRAY[99] OR
+           pgv_exists('rollback_package', 'other') THEN
+            RAISE EXCEPTION 'recreated package retained old records';
+        END IF;
+        PERFORM pgv_free();
+    END LOOP;
+END
+$$;
+
+-- Context names and identifiers must remain valid after init_record returns.
+-- This query also exercises the name reads under Valgrind.
+DO $$
+DECLARE
+    named_contexts integer;
+BEGIN
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NULL THEN
+        RETURN;
+    END IF;
+    PERFORM pgv_insert('memory_names', 'first_record', ROW (1), true);
+    PERFORM pgv_insert('memory_names', 'second_record', ROW (2), true);
+    PERFORM pgv_set('memory_names', 'scalar', repeat('x', 1000), true);
+    PERFORM * FROM pgv_list();
+    EXECUTE $query$
+        SELECT count(*)
+        FROM pg_catalog.pg_backend_memory_contexts
+        WHERE name = 'pg_variables: records'
+          AND ident IN ('first_record', 'second_record')
+    $query$ INTO named_contexts;
+    IF named_contexts <> 2 THEN
+        RAISE EXCEPTION 'record context names or identifiers did not survive';
+    END IF;
+END
+$$;

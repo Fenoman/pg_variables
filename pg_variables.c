@@ -688,6 +688,7 @@ textNameEquals(text *name, const char *key)
 {
 	int			name_len = VARSIZE_ANY_EXHDR(name);
 
+	/* initObjectHistory() initializes the key's entire fixed-size buffer. */
 	return name_len < NAMEDATALEN &&
 		key[name_len] == '\0' &&
 		memcmp(VARDATA_ANY(name), key, name_len) == 0;
@@ -1399,7 +1400,8 @@ variable_select(PG_FUNCTION_ARGS)
 		Assert(!HeapTupleHeaderHasExternal(
 										   (HeapTupleHeader) DatumGetPointer(item->tuple)));
 
-		SRF_RETURN_NEXT(funcctx, item->tuple);
+		/* The caller may mutate the collection before consuming this row. */
+		SRF_RETURN_NEXT(funcctx, datumCopy(item->tuple, false, -1));
 	}
 	else
 	{
@@ -1598,7 +1600,8 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		{
 			Assert(!HeapTupleHeaderHasExternal(
 											   (HeapTupleHeader) DatumGetPointer(item->tuple)));
-			SRF_RETURN_NEXT(funcctx, item->tuple);
+			/* Keep the result alive if a sibling expression changes the row. */
+			SRF_RETURN_NEXT(funcctx, datumCopy(item->tuple, false, -1));
 		}
 	}
 
@@ -1795,26 +1798,12 @@ static void
 removePackageInternal(Package *package)
 {
 	TransObject *transObject;
-	Variable   *variable;
-	HTAB	   *htab;
-	HASH_SEQ_STATUS vstat;
-	int			i;
 
-	/* Mark all the valid variables from package as deleted */
-	for (i = 0; i < 2; i++)
-	{
-		if ((htab = pack_htab(package, i)) != NULL)
-		{
-			hash_seq_init(&vstat, htab);
-
-			while ((variable =
-					(Variable *) hash_seq_search(&vstat)) != NULL)
-			{
-				if (GetActualState(variable)->is_valid)
-					variable->is_deleted = true;
-			}
-		}
-	}
+	/*
+	 * Removing the package changes only its state. Do not mark individual
+	 * records for reinitialization here: a package rollback would not restore
+	 * those flags. createVariableInternal() marks a recreated variable instead.
+	 */
 
 	/* All regular variables will be freed */
 	if (package->hctxRegular)
@@ -2247,6 +2236,15 @@ initObjectHistory(TransObject *object, TransObjectType type)
 	TransState *state;
 	MemoryContext statecontext = ModuleContext;
 	int			size;
+	Size		name_size;
+
+	/*
+	 * dynahash copies string keys only through their terminating NUL. Cache
+	 * lookups can test a longer name, so initialize the remaining bytes before
+	 * textNameEquals() reads key[name_len]. Keep this work out of cache lookups.
+	 */
+	name_size = strlen(object->name) + 1;
+	MemSet(object->name + name_size, 0, sizeof(object->name) - name_size);
 
 	size = (type == TRANS_PACKAGE ? sizeof(PackState) : sizeof(VarState));
 	if (type == TRANS_VARIABLE)
@@ -2543,6 +2541,14 @@ createVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 			addToChangesStack(&package->transObject, TRANS_PACKAGE);
 		}
 	}
+
+	/*
+	 * Revalidating a removed variable starts a new collection. This also covers
+	 * package recreation, which invalidates the old variable states in
+	 * createPackage(), without changing their flags at package removal time.
+	 */
+	if (!GetActualState(variable)->is_valid)
+		variable->is_deleted = true;
 
 	/*
 	 * If the variable has been created or has just become valid, increment
@@ -3254,6 +3260,10 @@ processChanges(Action action, bool sub)
 
 	/* Remove changes list of current level */
 	MemoryContextDelete(bottom_list->ctx);
+	/* The node and list heads belong to the parent stack context. */
+	pfree(bottom_list->changedVarsList);
+	pfree(bottom_list->changedPacksList);
+	pfree(bottom_list);
 	/* Remove the stack if it is empty */
 	if (dlist_is_empty(changesStack))
 	{

@@ -77,3 +77,52 @@ FROM pgv_select('sel_delete_uuid', 'r',
      AS t(k uuid, v text);
 SELECT pgv_free();
 -- End delete lifetime checks.
+
+-- Both SRF selectors must own the returned tuple before another ProjectSet
+-- expression updates its source. Test small AllocSet chunks and large tuples
+-- that pfree returns to malloc, for both regular and transactional variables.
+DO $$
+DECLARE
+    transactional boolean;
+    array_selector boolean;
+    payload_size integer;
+    before_update text;
+    updated boolean;
+BEGIN
+    FOREACH transactional IN ARRAY ARRAY[false, true] LOOP
+        FOREACH array_selector IN ARRAY ARRAY[false, true] LOOP
+            FOREACH payload_size IN ARRAY ARRAY[32, 32768] LOOP
+                PERFORM pgv_insert('srf_result', 'r',
+                                   ROW (1, repeat('a', payload_size)),
+                                   transactional);
+                IF array_selector THEN
+                    SELECT r::text, changed INTO before_update, updated
+                    FROM (
+                        SELECT pgv_select('srf_result', 'r', ARRAY[1]) AS r,
+                               pgv_update('srf_result', 'r',
+                                          ROW (1, repeat('b', payload_size)))
+                               AS changed
+                    ) AS s;
+                ELSE
+                    SELECT r::text, changed INTO before_update, updated
+                    FROM (
+                        SELECT pgv_select('srf_result', 'r') AS r,
+                               pgv_update('srf_result', 'r',
+                                          ROW (1, repeat('b', payload_size)))
+                               AS changed
+                    ) AS s;
+                END IF;
+                IF NOT updated OR before_update IS DISTINCT FROM
+                   '(1,' || repeat('a', payload_size) || ')' THEN
+                    RAISE EXCEPTION 'SRF result changed after source update';
+                END IF;
+                IF pgv_select('srf_result', 'r', 1)::text IS DISTINCT FROM
+                   '(1,' || repeat('b', payload_size) || ')' THEN
+                    RAISE EXCEPTION 'record update was not executed';
+                END IF;
+                PERFORM pgv_free();
+            END LOOP;
+        END LOOP;
+    END LOOP;
+END
+$$;

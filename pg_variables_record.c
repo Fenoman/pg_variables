@@ -134,24 +134,14 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 		variable->package->hctxTransact :
 		variable->package->hctxRegular;
 
-#if PG_VERSION_NUM >= 120000
-	record->hctx = AllocSetContextCreateInternal(topctx,
-												 hash_name,
-												 ALLOCSET_DEFAULT_MINSIZE,
-												 ALLOCSET_DEFAULT_INITSIZE,
-												 ALLOCSET_DEFAULT_MAXSIZE);
-#elif PG_VERSION_NUM >= 110000
-	record->hctx = AllocSetContextCreateExtended(topctx,
-												 hash_name,
-												 ALLOCSET_DEFAULT_MINSIZE,
-												 ALLOCSET_DEFAULT_INITSIZE,
-												 ALLOCSET_DEFAULT_MAXSIZE);
-#else
+	/* Context names must outlive the context; hash_name is stack storage. */
 	record->hctx = AllocSetContextCreate(topctx,
-										 hash_name,
-										 ALLOCSET_DEFAULT_MINSIZE,
-										 ALLOCSET_DEFAULT_INITSIZE,
-										 ALLOCSET_DEFAULT_MAXSIZE);
+									 "pg_variables: records",
+									 ALLOCSET_DEFAULT_MINSIZE,
+									 ALLOCSET_DEFAULT_INITSIZE,
+									 ALLOCSET_DEFAULT_MAXSIZE);
+#if PG_VERSION_NUM >= 110000
+	MemoryContextCopyAndSetIdentifier(record->hctx, GetName(variable));
 #endif
 
 	oldcxt = MemoryContextSwitchTo(record->hctx);
