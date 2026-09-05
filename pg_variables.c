@@ -2715,12 +2715,12 @@ removeObject(TransObject *object, TransObjectType type)
 		remove_variables_variable(&variables_stats, var);
 	}
 
-	/* Remove object from hash table */
-	hash_search(hash, object->name, HASH_REMOVE, &found);
-
 	/* Remove all object's states */
 	while (!dlist_is_empty(&object->states))
 		removeState(object, type, GetActualState(object));
+
+	/* HASH_REMOVE invalidates object, so finish accessing its states first. */
+	hash_search(hash, object->name, HASH_REMOVE, &found);
 
 	/* Remove package if it became empty */
 	if (type == TRANS_VARIABLE && isPackageEmpty(package))
