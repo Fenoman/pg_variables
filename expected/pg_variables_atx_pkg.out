@@ -307,9 +307,12 @@ BEGIN;
  
 (1 row)
 
--- ERROR:  unrecognized package "test"
+-- no rows: the scan ended with the variable
 	FETCH 1 IN r1_cur;
-ERROR:  unrecognized package "test"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 --
 --
@@ -339,9 +342,12 @@ BEGIN;
 (1 row)
 
 	ROLLBACK;
--- ERROR:  unrecognized package "test"
+-- no rows: pgv_free() ended the scan
 	FETCH 1 IN r1_cur;
-ERROR:  unrecognized package "test"
+ pgv_select 
+------------
+(0 rows)
+
 ROLLBACK;
 --
 --

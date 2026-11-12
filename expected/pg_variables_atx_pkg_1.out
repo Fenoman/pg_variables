@@ -338,7 +338,7 @@ ERROR:  cursor "r1_cur" does not exist
  
 (1 row)
 
--- ERROR:  unrecognized package "test"
+-- no rows: the scan ended with the variable
 	FETCH 1 IN r1_cur;
 ERROR:  cursor "r1_cur" does not exist
 ROLLBACK;
@@ -370,7 +370,7 @@ LINE 1: BEGIN AUTONOMOUS;
 		SELECT pgv_free();
 ERROR:  current transaction is aborted, commands ignored until end of transaction block
 	ROLLBACK;
--- ERROR:  unrecognized package "test"
+-- no rows: pgv_free() ended the scan
 	FETCH 1 IN r1_cur;
 ERROR:  cursor "r1_cur" does not exist
 ROLLBACK;

@@ -53,9 +53,9 @@ begin;
 -- 102:
 	select pgv_get('vars', 'int2', null::int);
 rollback;
--- 101:
+-- ERROR:  unrecognized package "vars": transactional variables end with the transaction
 select pgv_get('vars', 'int1', null::int);
--- vars:int1:
+-- no rows:
 select * from pgv_list() order by package, name;
 
 select pgv_free();
@@ -67,11 +67,10 @@ select pgv_insert('test', 'x', row (1::int, 2::int), false);
 select pgv_insert('test', 'x', row (2::int, 3::int), false);
 select pgv_insert('test', 'x', row (3::int, 4::int), false);
 
-select pgv_insert('test', 'y', row (10::int, 20::int), true);
-select pgv_insert('test', 'y', row (20::int, 30::int), true);
-select pgv_insert('test', 'y', row (30::int, 40::int), true);
-
 begin;
+	select pgv_insert('test', 'y', row (10::int, 20::int), true);
+	select pgv_insert('test', 'y', row (20::int, 30::int), true);
+	select pgv_insert('test', 'y', row (30::int, 40::int), true);
 	declare r1_cur cursor for select pgv_select('test', 'x');
 	begin autonomous;
 		begin autonomous;
@@ -124,8 +123,10 @@ begin;
 -- 102:
 	select pgv_get('vars', 'trans_int', null::int);
 	rollback to sp1;
-commit;
 -- 101:
+	select pgv_get('vars', 'trans_int', null::int);
+commit;
+-- ERROR:  unrecognized package "vars"
 select pgv_get('vars', 'trans_int', null::int);
 
 select pgv_free();
@@ -174,8 +175,8 @@ select pgv_free();
 -- Sample with (subxact inside ATX) == (subxact outside ATX)
 ------------------------------------------------------------
 select pgv_set('vars1', 'int1', 0);
-select pgv_set('vars1', 'trans_int1', 0, true);
 begin;
+	select pgv_set('vars1', 'trans_int1', 0, true);
 	begin autonomous;
 		select pgv_set('vars1', 'int1', 1);
 		select pgv_set('vars1', 'trans_int1', 2, true);
@@ -185,12 +186,14 @@ begin;
 -- 2
 		select pgv_get('vars1', 'trans_int1', null::int);
 	commit;
+-- 1, 0
+	select pgv_get('vars1', 'int1', null::int), pgv_get('vars1', 'trans_int1', null::int);
 rollback;
--- vars1:int1, vars1:trans_int1
+-- vars1:int1
 select * from pgv_list() order by package, name;
 -- 1
 select pgv_get('vars1', 'int1', null::int);
--- 0
+-- ERROR:  unrecognized variable "trans_int1"
 select pgv_get('vars1', 'trans_int1', null::int);
 
 select pgv_free();

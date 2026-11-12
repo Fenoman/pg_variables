@@ -147,7 +147,7 @@ BEGIN;
 -- (3,4)
 	FETCH 1 IN r1_cur;
 	SELECT pgv_remove('test', 'x');
--- ERROR:  unrecognized package "test"
+-- no rows: the scan ended with the variable
 	FETCH 1 IN r1_cur;
 ROLLBACK;
 --
@@ -163,7 +163,7 @@ BEGIN;
 	BEGIN AUTONOMOUS;
 		SELECT pgv_free();
 	ROLLBACK;
--- ERROR:  unrecognized package "test"
+-- no rows: pgv_free() ended the scan
 	FETCH 1 IN r1_cur;
 ROLLBACK;
 --
