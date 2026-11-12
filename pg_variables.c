@@ -294,6 +294,21 @@ VariableStatEntry_is_transactional(void *entry, void *value)
 {
 	return ((VariableStatEntry *) entry)->variable->is_transactional;
 }
+
+/*
+ * Match entries started at the given ATX level or deeper.
+ */
+static bool
+VariableStatEntry_atxlevel_ge(void *entry, void *value)
+{
+	return ((VariableStatEntry *) entry)->levels.atxlevel >= *(int *) value;
+}
+
+static bool
+PackageStatEntry_atxlevel_ge(void *entry, void *value)
+{
+	return ((PackageStatEntry *) entry)->levels.atxlevel >= *(int *) value;
+}
 #endif
 
 /*
@@ -656,6 +671,48 @@ remove_variables_transactional(List **list)
 		.term = true,
 		.clear_fctx = VariableStatEntry_clear_fctx,
 		.deactivate = VariableStatEntry_deactivate
+	};
+
+	list_remove_if(ctx);
+}
+
+/*
+ * Remove the variables entries started at ATX level atxlevel or deeper.
+ */
+static void
+remove_variables_atxlevel(List **list, int atxlevel)
+{
+	RemoveIfContext ctx =
+	{
+		.list = list,
+		.value = &atxlevel,
+		.eq = VariableStatEntry_atxlevel_ge,
+		.getter = VariableStatEntry_status_ptr,
+		.match_first = false,
+		.term = true,
+		.clear_fctx = VariableStatEntry_clear_fctx,
+		.deactivate = VariableStatEntry_deactivate
+	};
+
+	list_remove_if(ctx);
+}
+
+/*
+ * Remove the packages entries started at ATX level atxlevel or deeper.
+ */
+static void
+remove_packages_atxlevel(List **list, int atxlevel)
+{
+	RemoveIfContext ctx =
+	{
+		.list = list,
+		.value = &atxlevel,
+		.eq = PackageStatEntry_atxlevel_ge,
+		.getter = PackageStatEntry_status_ptr,
+		.match_first = false,
+		.term = true,
+		.clear_fctx = PackageStatEntry_clear_fctx,
+		.deactivate = PackageStatEntry_deactivate
 	};
 
 	list_remove_if(ctx);
@@ -3664,12 +3721,30 @@ packageStatEntryShutdown(void *arg)
 }
 
 /*
- * Free hash_seq_search scans
+ * End the hash_seq_search scans at the end of a transaction.
+ *
+ * Each scan is unregistered and dropped from its list, and its
+ * set-returning function returns no more rows.
+ *
+ * In an autonomous transaction of Postgres Pro Enterprise only the scans
+ * started in it or in its nested autonomous transactions end. The parent
+ * transaction goes on after the autonomous one, and so do its scans: a
+ * FOR loop over pgv_select() with an autonomous block in the body sees all
+ * the rows.
  */
 static void
 freeStatsLists(void)
 {
 	ListCell   *cell;
+
+#ifdef PGPRO_EE
+	if (getNestLevelATX() > 0)
+	{
+		remove_variables_atxlevel(&variables_stats, getNestLevelATX());
+		remove_packages_atxlevel(&packages_stats, getNestLevelATX());
+		return;
+	}
+#endif
 
 	foreach(cell, variables_stats)
 	{
