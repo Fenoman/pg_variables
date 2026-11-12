@@ -24,18 +24,21 @@ SELECT * FROM pgv_list() order by package, name;
  vars    | int2 | f
 ```
 
-But if variable created with flag **is_transactional**:
+But a variable created with flag **is_transactional** follows savepoints and
+lives only until the end of its transaction:
 ```sql
 BEGIN;
 SELECT pgv_set('vars', 'trans_int', 101, true);
 SAVEPOINT sp1;
 SELECT pgv_set('vars', 'trans_int', 102, true);
 ROLLBACK TO sp1;
-COMMIT;
 SELECT pgv_get('vars', 'trans_int', NULL::int);
  pgv_get
 ---------
      101
+COMMIT;
+SELECT pgv_get('vars', 'trans_int', NULL::int);
+ERROR:  unrecognized variable "trans_int"
 ```
 
 You can aggregate variables into packages. This is done to be able to have
