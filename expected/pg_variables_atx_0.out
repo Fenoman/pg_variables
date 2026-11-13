@@ -130,10 +130,10 @@ ERROR:  unrecognized package "vars"
 ERROR:  unrecognized package "vars"
 rollback;
 WARNING:  there is no transaction in progress
--- 101:
+-- ERROR:  unrecognized package "vars": transactional variables end with the transaction
 select pgv_get('vars', 'int1', null::int);
 ERROR:  unrecognized package "vars"
--- vars:int1:
+-- no rows:
 select * from pgv_list() order by package, name;
  package | name | is_transactional 
 ---------+------+------------------
@@ -166,25 +166,25 @@ select pgv_insert('test', 'x', row (3::int, 4::int), false);
  
 (1 row)
 
-select pgv_insert('test', 'y', row (10::int, 20::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
-select pgv_insert('test', 'y', row (20::int, 30::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
-select pgv_insert('test', 'y', row (30::int, 40::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
 begin;
+	select pgv_insert('test', 'y', row (10::int, 20::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+	select pgv_insert('test', 'y', row (20::int, 30::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+	select pgv_insert('test', 'y', row (30::int, 40::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
 	declare r1_cur cursor for select pgv_select('test', 'x');
 	begin autonomous;
 ERROR:  syntax error at or near "autonomous"
@@ -298,9 +298,12 @@ ERROR:  current transaction is aborted, commands ignored until end of transactio
 ERROR:  unrecognized package "vars"
 	rollback to sp1;
 ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+-- 101:
+	select pgv_get('vars', 'trans_int', null::int);
+ERROR:  unrecognized package "vars"
 commit;
 WARNING:  there is no transaction in progress
--- 101:
+-- ERROR:  unrecognized package "vars"
 select pgv_get('vars', 'trans_int', null::int);
 ERROR:  unrecognized package "vars"
 select pgv_free();
@@ -399,13 +402,13 @@ select pgv_set('vars1', 'int1', 0);
  
 (1 row)
 
-select pgv_set('vars1', 'trans_int1', 0, true);
+begin;
+	select pgv_set('vars1', 'trans_int1', 0, true);
  pgv_set 
 ---------
  
 (1 row)
 
-begin;
 	begin autonomous;
 ERROR:  syntax error at or near "autonomous"
 LINE 1: begin autonomous;
@@ -424,9 +427,12 @@ ERROR:  savepoint "sp2" does not exist
 		select pgv_get('vars1', 'trans_int1', null::int);
 ERROR:  current transaction is aborted, commands ignored until end of transaction block
 	commit;
+-- 1, 0
+	select pgv_get('vars1', 'int1', null::int), pgv_get('vars1', 'trans_int1', null::int);
+ERROR:  unrecognized variable "trans_int1"
 rollback;
 WARNING:  there is no transaction in progress
--- vars1:int1, vars1:trans_int1
+-- vars1:int1
 select * from pgv_list() order by package, name;
  package | name | is_transactional 
 ---------+------+------------------
@@ -440,7 +446,7 @@ select pgv_get('vars1', 'int1', null::int);
        0
 (1 row)
 
--- 0
+-- ERROR:  unrecognized variable "trans_int1"
 select pgv_get('vars1', 'trans_int1', null::int);
 ERROR:  unrecognized variable "trans_int1"
 select pgv_free();

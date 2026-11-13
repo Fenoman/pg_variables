@@ -147,7 +147,7 @@ BEGIN;
 -- (3,4)
 	FETCH 1 IN r1_cur;
 	SELECT pgv_remove('test', 'x');
--- ERROR:  unrecognized package "test"
+-- no rows: the scan ended with the variable
 	FETCH 1 IN r1_cur;
 ROLLBACK;
 --
@@ -163,7 +163,7 @@ BEGIN;
 	BEGIN AUTONOMOUS;
 		SELECT pgv_free();
 	ROLLBACK;
--- ERROR:  unrecognized package "test"
+-- no rows: pgv_free() ended the scan
 	FETCH 1 IN r1_cur;
 ROLLBACK;
 --
@@ -236,3 +236,118 @@ BEGIN;
 		SELECT pgv_free();
 	COMMIT;
 ROLLBACK;
+--
+--
+-- Test for case: an autonomous transaction ends only its own scans. A scan
+-- of the parent transaction (pgv_select, pgv_stats) continues after the
+-- autonomous transaction commits or rolls back and runs to its end.
+--
+SELECT pgv_free();
+DO $$
+BEGIN
+	FOR i IN 1..25 LOOP
+		PERFORM pgv_insert('test', 'x', row (i, i * 10), false);
+	END LOOP;
+END $$;
+CREATE FUNCTION pgv_atx_set(n int) RETURNS void AS $$
+BEGIN AUTONOMOUS
+	PERFORM pgv_set('vars', 'n', n);
+END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION pgv_atx_count(c refcursor) RETURNS int AS $$
+DECLARE
+	r			record;
+	n			int := 0;
+BEGIN
+	LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		n := n + 1;
+	END LOOP;
+	RETURN n;
+END;
+$$ LANGUAGE plpgsql;
+-- NOTICE:  rows: 25, 25
+DO $$
+DECLARE
+	r			record;
+	n_block		int := 0;
+	n_function	int := 0;
+BEGIN
+	FOR r IN SELECT pgv_select('test', 'x') LOOP
+		n_block := n_block + 1;
+		BEGIN AUTONOMOUS
+			PERFORM pgv_set('vars', 'n', n_block);
+		END;
+	END LOOP;
+	FOR r IN SELECT pgv_select('test', 'x') LOOP
+		n_function := n_function + 1;
+		PERFORM pgv_atx_set(n_function);
+	END LOOP;
+	RAISE NOTICE 'rows: %, %', n_block, n_function;
+END $$;
+BEGIN;
+	DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'x');
+	MOVE 1 IN r1_cur;
+	BEGIN AUTONOMOUS;
+		SELECT pgv_set('vars', 'n', 1);
+	COMMIT;
+	BEGIN AUTONOMOUS;
+	ROLLBACK;
+-- 24
+	SELECT pgv_atx_count('r1_cur');
+-- no rows
+	FETCH 1 IN r1_cur;
+COMMIT;
+-- Nested: a scan of an autonomous transaction survives the inner one.
+BEGIN;
+	BEGIN AUTONOMOUS;
+		DECLARE r2_cur CURSOR FOR SELECT pgv_select('test', 'x');
+		MOVE 1 IN r2_cur;
+		BEGIN AUTONOMOUS;
+			SELECT pgv_set('vars', 'n', 2);
+		COMMIT;
+-- 24
+		SELECT pgv_atx_count('r2_cur');
+	COMMIT;
+COMMIT;
+-- Packages scan: test, vars, vars2, vars3.
+SELECT pgv_set('vars2', 'a', 1), pgv_set('vars3', 'a', 1);
+BEGIN;
+	DECLARE r3_cur CURSOR FOR SELECT pgv_stats();
+	MOVE 1 IN r3_cur;
+	BEGIN AUTONOMOUS;
+		SELECT pgv_set('vars', 'n', 3);
+	COMMIT;
+-- 3
+	SELECT pgv_atx_count('r3_cur');
+COMMIT;
+-- Scans of the parent and of the autonomous transaction are open together:
+-- the unread scan of the autonomous one ends with it, the parent goes on.
+BEGIN;
+	DECLARE r5_cur CURSOR FOR SELECT pgv_select('test', 'x');
+	MOVE 1 IN r5_cur;
+	BEGIN AUTONOMOUS;
+		DECLARE r6_cur CURSOR FOR SELECT pgv_select('test', 'x');
+		MOVE 3 IN r6_cur;
+	COMMIT;
+	BEGIN AUTONOMOUS;
+		DECLARE r7_cur CURSOR FOR SELECT pgv_select('test', 'x');
+		MOVE 3 IN r7_cur;
+	ROLLBACK;
+-- 24
+	SELECT pgv_atx_count('r5_cur');
+COMMIT;
+-- The autonomous transaction removes the variable the parent scans.
+BEGIN;
+	DECLARE r4_cur CURSOR FOR SELECT pgv_select('test', 'x');
+	MOVE 1 IN r4_cur;
+	BEGIN AUTONOMOUS;
+		SELECT pgv_remove('test', 'x');
+	COMMIT;
+-- 0
+	SELECT pgv_atx_count('r4_cur');
+COMMIT;
+DROP FUNCTION pgv_atx_set(int);
+DROP FUNCTION pgv_atx_count(refcursor);
+SELECT pgv_free();

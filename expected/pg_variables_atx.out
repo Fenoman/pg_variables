@@ -166,19 +166,14 @@ begin;
 (1 row)
 
 rollback;
--- 101:
+-- ERROR:  unrecognized package "vars": transactional variables end with the transaction
 select pgv_get('vars', 'int1', null::int);
- pgv_get 
----------
-     101
-(1 row)
-
--- vars:int1:
+ERROR:  unrecognized package "vars"
+-- no rows:
 select * from pgv_list() order by package, name;
  package | name | is_transactional 
 ---------+------+------------------
- vars    | int1 | t
-(1 row)
+(0 rows)
 
 select pgv_free();
  pgv_free 
@@ -207,25 +202,25 @@ select pgv_insert('test', 'x', row (3::int, 4::int), false);
  
 (1 row)
 
-select pgv_insert('test', 'y', row (10::int, 20::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
-select pgv_insert('test', 'y', row (20::int, 30::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
-select pgv_insert('test', 'y', row (30::int, 40::int), true);
- pgv_insert 
-------------
- 
-(1 row)
-
 begin;
+	select pgv_insert('test', 'y', row (10::int, 20::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+	select pgv_insert('test', 'y', row (20::int, 30::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+	select pgv_insert('test', 'y', row (30::int, 40::int), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
 	declare r1_cur cursor for select pgv_select('test', 'x');
 	begin autonomous;
 		begin autonomous;
@@ -355,14 +350,17 @@ begin;
 (1 row)
 
 	rollback to sp1;
-commit;
 -- 101:
-select pgv_get('vars', 'trans_int', null::int);
+	select pgv_get('vars', 'trans_int', null::int);
  pgv_get 
 ---------
      101
 (1 row)
 
+commit;
+-- ERROR:  unrecognized package "vars"
+select pgv_get('vars', 'trans_int', null::int);
+ERROR:  unrecognized package "vars"
 select pgv_free();
  pgv_free 
 ----------
@@ -504,13 +502,13 @@ select pgv_set('vars1', 'int1', 0);
  
 (1 row)
 
-select pgv_set('vars1', 'trans_int1', 0, true);
+begin;
+	select pgv_set('vars1', 'trans_int1', 0, true);
  pgv_set 
 ---------
  
 (1 row)
 
-begin;
 	begin autonomous;
 		select pgv_set('vars1', 'int1', 1);
  pgv_set 
@@ -540,14 +538,20 @@ begin;
 (1 row)
 
 	commit;
+-- 1, 0
+	select pgv_get('vars1', 'int1', null::int), pgv_get('vars1', 'trans_int1', null::int);
+ pgv_get | pgv_get 
+---------+---------
+       1 |       0
+(1 row)
+
 rollback;
--- vars1:int1, vars1:trans_int1
+-- vars1:int1
 select * from pgv_list() order by package, name;
- package |    name    | is_transactional 
----------+------------+------------------
- vars1   | int1       | f
- vars1   | trans_int1 | t
-(2 rows)
+ package | name | is_transactional 
+---------+------+------------------
+ vars1   | int1 | f
+(1 row)
 
 -- 1
 select pgv_get('vars1', 'int1', null::int);
@@ -556,13 +560,9 @@ select pgv_get('vars1', 'int1', null::int);
        1
 (1 row)
 
--- 0
+-- ERROR:  unrecognized variable "trans_int1"
 select pgv_get('vars1', 'trans_int1', null::int);
- pgv_get 
----------
-       0
-(1 row)
-
+ERROR:  unrecognized variable "trans_int1"
 select pgv_free();
  pgv_free 
 ----------

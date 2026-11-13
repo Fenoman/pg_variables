@@ -294,6 +294,21 @@ VariableStatEntry_is_transactional(void *entry, void *value)
 {
 	return ((VariableStatEntry *) entry)->variable->is_transactional;
 }
+
+/*
+ * Match entries started at the given ATX level or deeper.
+ */
+static bool
+VariableStatEntry_atxlevel_ge(void *entry, void *value)
+{
+	return ((VariableStatEntry *) entry)->levels.atxlevel >= *(int *) value;
+}
+
+static bool
+PackageStatEntry_atxlevel_ge(void *entry, void *value)
+{
+	return ((PackageStatEntry *) entry)->levels.atxlevel >= *(int *) value;
+}
 #endif
 
 /*
@@ -656,6 +671,48 @@ remove_variables_transactional(List **list)
 		.term = true,
 		.clear_fctx = VariableStatEntry_clear_fctx,
 		.deactivate = VariableStatEntry_deactivate
+	};
+
+	list_remove_if(ctx);
+}
+
+/*
+ * Remove the variables entries started at ATX level atxlevel or deeper.
+ */
+static void
+remove_variables_atxlevel(List **list, int atxlevel)
+{
+	RemoveIfContext ctx =
+	{
+		.list = list,
+		.value = &atxlevel,
+		.eq = VariableStatEntry_atxlevel_ge,
+		.getter = VariableStatEntry_status_ptr,
+		.match_first = false,
+		.term = true,
+		.clear_fctx = VariableStatEntry_clear_fctx,
+		.deactivate = VariableStatEntry_deactivate
+	};
+
+	list_remove_if(ctx);
+}
+
+/*
+ * Remove the packages entries started at ATX level atxlevel or deeper.
+ */
+static void
+remove_packages_atxlevel(List **list, int atxlevel)
+{
+	RemoveIfContext ctx =
+	{
+		.list = list,
+		.value = &atxlevel,
+		.eq = PackageStatEntry_atxlevel_ge,
+		.getter = PackageStatEntry_status_ptr,
+		.match_first = false,
+		.term = true,
+		.clear_fctx = PackageStatEntry_clear_fctx,
+		.deactivate = PackageStatEntry_deactivate
 	};
 
 	list_remove_if(ctx);
@@ -2657,12 +2714,14 @@ removeObject(TransObject *object, TransObjectType type)
 
 	if (type == TRANS_PACKAGE)
 	{
-		package = (Package *) object;
-
 #ifdef PGPRO_EE
 		PackageContext *context,
 				   *next;
+#endif
 
+		package = (Package *) object;
+
+#ifdef PGPRO_EE
 		/*
 		 * Do not delete package inside autonomous transaction: it could be
 		 * used in parent transaction. But we can delete package without any
@@ -3283,27 +3342,28 @@ processChanges(Action action, bool sub)
 }
 
 /*
- * ATX and connection pooling are not compatible with pg_variables.
+ * Refuse to run in a pooled backend of the Postgres Pro Enterprise built-in
+ * connection pooler.
+ *
+ * Why. Variables live in the memory of the backend process. A pooled backend
+ * serves several client sessions in turn, so one session would see the
+ * variables of another.
+ *
+ * Where it checks. Only Enterprise 11-16: their built-in pooler clears
+ * IsDedicatedBackend in a pooled backend. Enterprise 17 has no built-in
+ * pooler, and the Enterprise 18 headers have no IsDedicatedBackend. Other
+ * builds check nothing.
+ *
+ * What it misses. Proxima, the pooler extension of Enterprise 18, keeps a
+ * client on one backend only in a dedicated session and does not see
+ * pg_variables state: with Proxima the client runs
+ * SET proxima.force_dedicated = true before using variables. External poolers
+ * (pg_doorman, Odyssey, PgBouncer) are invisible to the server on any edition.
  */
 static void
 compatibility_check(void)
 {
-	/* ----------------------
-	 * | Edition | ConnPool |
-	 * ----------------------
-	 * | std 9.6 | no       |
-	 * | std 10  | no       |
-	 * | std 11  | no       |
-	 * | std 12  | no       |
-	 * | std 13  | no       |
-	 * |  ee 9.6 | no       |
-	 * |  ee 10  | no       |
-	 * |  ee 11  | yes      |
-	 * |  ee 12  | yes      |
-	 * |  ee 13  | yes      |
-	 * ----------------------
-	 */
-#if defined(PGPRO_EE) && PG_VERSION_NUM >= 110000
+#if defined(PGPRO_EE) && PG_VERSION_NUM >= 110000 && PG_VERSION_NUM < 170000
 	if (!IsDedicatedBackend)
 	{
 		freeStatsLists();
@@ -3661,12 +3721,30 @@ packageStatEntryShutdown(void *arg)
 }
 
 /*
- * Free hash_seq_search scans
+ * End the hash_seq_search scans at the end of a transaction.
+ *
+ * Each scan is unregistered and dropped from its list, and its
+ * set-returning function returns no more rows.
+ *
+ * In an autonomous transaction of Postgres Pro Enterprise only the scans
+ * started in it or in its nested autonomous transactions end. The parent
+ * transaction goes on after the autonomous one, and so do its scans: a
+ * FOR loop over pgv_select() with an autonomous block in the body sees all
+ * the rows.
  */
 static void
 freeStatsLists(void)
 {
 	ListCell   *cell;
+
+#ifdef PGPRO_EE
+	if (getNestLevelATX() > 0)
+	{
+		remove_variables_atxlevel(&variables_stats, getNestLevelATX());
+		remove_packages_atxlevel(&packages_stats, getNestLevelATX());
+		return;
+	}
+#endif
 
 	foreach(cell, variables_stats)
 	{
