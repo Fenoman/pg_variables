@@ -91,26 +91,23 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 
 	Assert(variable->typid == RECORDOID);
 
+	if (tupdesc->natts == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("record must have at least one attribute")));
+	if (GetTupleDescAttr(tupdesc, 0)->attisdropped)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("record key attribute must not be dropped")));
+
 	/* First get hash and match functions for key type. */
 	keyid = GetTupleDescAttr(tupdesc, 0)->atttypid;
 	typentry = lookup_type_cache(keyid,
 								 TYPECACHE_HASH_PROC_FINFO |
 								 TYPECACHE_CMP_PROC_FINFO);
 
-	/*
-	 * In case something went wrong, you need to roll back the changes before
-	 * completing the transaction, because the variable may be regular and not
-	 * present in list of changed vars.
-	 */
 	if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
 	{
-		/*
-		 * The variable was just created. Unwind it through removeVariable() so
-		 * that a transactional variable already registered in changesStack is
-		 * invalidated in place rather than physically removed, which would
-		 * leave a dangling ChangedObject and crash the backend at commit.
-		 */
-		removeVariable(variable);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("could not identify a hash function for type %s",
@@ -119,7 +116,6 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 
 	if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
 	{
-		removeVariable(variable);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("could not identify a matching function for type %s",
@@ -203,17 +199,17 @@ coerce_unknown_rewrite_tupdesc(TupleDesc old_tupdesc, TupleDesc *return_tupdesc)
 		Form_pg_attribute attr = GetTupleDescAttr(old_tupdesc, i);
 
 		if (attr->atttypid == UNKNOWNOID)
-		{
-			FormData_pg_attribute new_attr = *attr;
+			TupleDescInitEntry(*return_tupdesc, i + 1,
+							   NameStr(attr->attname), TEXTOID, -1,
+							   attr->attndims);
 
-			new_attr.atttypid = TEXTOID;
-			new_attr.attlen = -1;
-			new_attr.atttypmod = -1;
-			memcpy(TupleDescAttr((*return_tupdesc), i), &new_attr, sizeof(FormData_pg_attribute));
+		/* Changed alignment can invalidate offsets of subsequent fields too. */
 #if PG_VERSION_NUM >= 180000
-			populate_compact_attribute(*return_tupdesc, i);
-#endif			
-		}
+		populate_compact_attribute(*return_tupdesc, i);
+		TupleDescCompactAttr(*return_tupdesc, i)->attcacheoff = -1;
+#else
+		TupleDescAttr(*return_tupdesc, i)->attcacheoff = -1;
+#endif
 	}
 }
 
@@ -453,8 +449,18 @@ insert_record(Variable *variable, HeapTupleHeader tupleHeader)
 	k.hash_proc = &record->hash_proc;
 	k.cmp_proc = &record->cmp_proc;
 
-	item = (HashRecordEntry *) hash_search(record->rhash, &k,
-										   HASH_ENTER, &found);
+	PG_TRY();
+	{
+		item = (HashRecordEntry *) hash_search(record->rhash, &k,
+											   HASH_ENTER, &found);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		pfree(DatumGetPointer(tuple));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (found)
 	{
 		pfree(DatumGetPointer(tuple));
@@ -500,8 +506,18 @@ update_record(Variable *variable, HeapTupleHeader tupleHeader)
 	k.hash_proc = &record->hash_proc;
 	k.cmp_proc = &record->cmp_proc;
 
-	item = (HashRecordEntry *) hash_search(record->rhash, &k,
-										   HASH_FIND, &found);
+	PG_TRY();
+	{
+		item = (HashRecordEntry *) hash_search(record->rhash, &k,
+											   HASH_FIND, &found);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		pfree(DatumGetPointer(tuple));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (!found)
 	{
 		pfree(DatumGetPointer(tuple));
@@ -550,6 +566,8 @@ delete_record(Variable *variable, Datum value, bool is_null)
 	if (!found)
 		return false;
 
+	check_record_delete_allowed(variable);
+
 	/* HASH_REMOVE returns a dangling entry, so save its tuple beforehand. */
 	tuple = item->tuple;
 	(void) hash_search_with_hash_value(record->rhash, &k, hashvalue,
@@ -586,8 +604,18 @@ insert_record_copy(RecordVar *dest_record, Datum src_tuple, Variable *variable)
 	k.hash_proc = &dest_record->hash_proc;
 	k.cmp_proc = &dest_record->cmp_proc;
 
-	item = (HashRecordEntry *) hash_search(dest_record->rhash, &k,
-										   HASH_ENTER, &found);
+	PG_TRY();
+	{
+		item = (HashRecordEntry *) hash_search(dest_record->rhash, &k,
+											   HASH_ENTER, &found);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		pfree(DatumGetPointer(tuple));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (found)
 	{
 		pfree(DatumGetPointer(tuple));

@@ -181,6 +181,10 @@ typedef struct tagVariableStatEntry
 	Levels		levels;
 	void	  **user_fctx; /* pointer to funcctx->user_fctx */
 	bool		active;
+	bool		full_scan;
+	HashRecordEntry **rows;
+	long		num_rows;
+	long		next_row;
 	MemoryContextCallback callback;
 }			VariableStatEntry;
 
@@ -190,6 +194,10 @@ typedef struct tagPackageStatEntry
 	Levels		levels;
 	void	  **user_fctx; /* pointer to funcctx->user_fctx */
 	bool		active;
+	TupleDesc	tupdesc;
+	Datum	   *rows;
+	long		num_rows;
+	long		next_row;
 	MemoryContextCallback callback;
 }			PackageStatEntry;
 
@@ -1194,30 +1202,34 @@ variable_insert(PG_FUNCTION_ARGS)
 		PG_RETURN_VOID();
 	}
 
-	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
-
 	if (!record->tupdesc || variable->is_deleted)
 	{
-		/*
-		 * This is the first record for the var_name. Initialize record.
-		 */
-		if (variable->is_deleted && record->hctx)
-		{
-			remove_variables_variable(&variables_stats, variable);
-			MemoryContextDelete(record->hctx);
-			memset(record, 0, sizeof(RecordVar));
-		}
+		MemoryContext oldcxt = CurrentMemoryContext;
 
-		/* Convert UNKNOWNOID to TEXTOID if needed
-		 * tupdesc may be changed
-		 */
-		if (convert_unknownoid)
+		PG_TRY();
 		{
-			coerce_unknown_first_record(&tupdesc, &rec);
-		}
+			tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+			if (variable->is_deleted && record->hctx)
+			{
+				remove_variables_variable(&variables_stats, variable);
+				MemoryContextDelete(record->hctx);
+				memset(record, 0, sizeof(RecordVar));
+			}
 
-		init_record(record, tupdesc, variable);
-		variable->is_deleted = false;
+			if (convert_unknownoid)
+				coerce_unknown_first_record(&tupdesc, &rec);
+
+			init_record(record, tupdesc, variable);
+			variable->is_deleted = false;
+		}
+		PG_CATCH();
+		{
+			/* Regular entries survive abort, so discard incomplete records. */
+			MemoryContextSwitchTo(oldcxt);
+			removeVariable(variable);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 	else
 	{
@@ -1227,7 +1239,10 @@ variable_insert(PG_FUNCTION_ARGS)
 		 * Also we convert UNKNOWNOID to TEXTOID if needed.
 		 * tupdesc may be changed
 		 */
-		bool		coerced = check_attributes(variable, &rec, tupdesc);
+		bool		coerced;
+
+		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+		coerced = check_attributes(variable, &rec, tupdesc);
 
 		/*
 		 * Cache this rowtype for the fast path only when it is an anonymous
@@ -1374,12 +1389,32 @@ variable_delete(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(res);
 }
 
+void
+check_record_delete_allowed(Variable *variable)
+{
+	ListCell   *cell;
+	HTAB	   *hash = GetActualValue(variable).record.rhash;
+
+	foreach(cell, variables_stats)
+	{
+		VariableStatEntry *entry = lfirst(cell);
+
+		if (entry->active && entry->full_scan && entry->hash == hash)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("cannot delete records from variable \"%s\" while a full scan is active",
+							GetName(variable)),
+					 errhint("Close or finish the full scan before deleting records.")));
+	}
+}
+
 Datum
 variable_select(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
 	HASH_SEQ_STATUS *rstat;
 	HashRecordEntry *item;
+	VariableStatEntry *entry;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -1390,7 +1425,6 @@ variable_select(PG_FUNCTION_ARGS)
 		Package    *package;
 		Variable   *variable;
 		RecordVar  *record;
-		VariableStatEntry *entry;
 
 		CHECK_ARGS_FOR_NULL();
 
@@ -1420,6 +1454,7 @@ variable_select(PG_FUNCTION_ARGS)
 #endif
 		entry->user_fctx = &funcctx->user_fctx;
 		entry->active = true;
+		entry->full_scan = true;
 		entry->callback.func = variableStatEntryShutdown;
 		entry->callback.arg = entry;
 
@@ -1431,7 +1466,7 @@ variable_select(PG_FUNCTION_ARGS)
 										   &entry->callback);
 		hash_seq_init(rstat, record->rhash);
 		entry->status = rstat;
-		funcctx->user_fctx = rstat;
+		funcctx->user_fctx = entry;
 
 		MemoryContextSwitchTo(oldcontext);
 		PG_FREE_IF_COPY(package_name, 0);
@@ -1450,8 +1485,16 @@ variable_select(PG_FUNCTION_ARGS)
 	}
 
 	/* Get next hash record */
-	rstat = (HASH_SEQ_STATUS *) funcctx->user_fctx;
-	item = (HashRecordEntry *) hash_seq_search(rstat);
+	entry = (VariableStatEntry *) funcctx->user_fctx;
+	rstat = entry->status;
+	if (rstat)
+		item = (HashRecordEntry *) hash_seq_search(rstat);
+	else
+	{
+		if (entry->next_row == entry->num_rows)
+			SRF_RETURN_DONE(funcctx);
+		item = entry->rows[entry->next_row++];
+	}
 	if (item != NULL)
 	{
 		Assert(!HeapTupleHeaderHasExternal(
@@ -1462,7 +1505,8 @@ variable_select(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		remove_variables_status(&variables_stats, rstat);
+		if (rstat)
+			remove_variables_status(&variables_stats, rstat);
 		SRF_RETURN_DONE(funcctx);
 	}
 }
@@ -2101,9 +2145,27 @@ getMemoryTotalSpace(MemoryContext context, int level, Size *totalspace)
 #endif
 }
 
-/*
- * Get list of assigned packages and used memory in bytes.
- */
+static Datum
+package_stats_tuple(Package *package, TupleDesc tupdesc)
+{
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	HeapTuple	tuple;
+	Size		regularSpace = 0,
+				transactSpace = 0;
+
+	values[0] = PointerGetDatum(cstring_to_text(GetName(package)));
+	if (package->hctxRegular)
+		getMemoryTotalSpace(package->hctxRegular, 0, &regularSpace);
+	if (package->hctxTransact)
+		getMemoryTotalSpace(package->hctxTransact, 0, &transactSpace);
+	values[1] = Int64GetDatum(regularSpace + transactSpace);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(DatumGetPointer(values[0]));
+	return HeapTupleGetDatum(tuple);
+}
+
+/* Get package memory statistics. */
 Datum
 get_packages_stats(PG_FUNCTION_ARGS)
 {
@@ -2111,6 +2173,7 @@ get_packages_stats(PG_FUNCTION_ARGS)
 	MemoryContext oldcontext;
 	HASH_SEQ_STATUS *rstat;
 	Package    *package;
+	PackageStatEntry *entry;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -2134,12 +2197,12 @@ get_packages_stats(PG_FUNCTION_ARGS)
 		 */
 		if (packagesHash)
 		{
-			PackageStatEntry *entry;
 			MemoryContext listcontext;
 
 			rstat = (HASH_SEQ_STATUS *) palloc0(sizeof(HASH_SEQ_STATUS));
 			entry = palloc0(sizeof(PackageStatEntry));
 			entry->status = NULL;
+			entry->tupdesc = funcctx->tuple_desc;
 			entry->levels.level = GetCurrentTransactionNestLevel();
 #ifdef PGPRO_EE
 			entry->levels.atxlevel = getNestLevelATX();
@@ -2159,7 +2222,7 @@ get_packages_stats(PG_FUNCTION_ARGS)
 			/* Get packages list */
 			hash_seq_init(rstat, packagesHash);
 			entry->status = rstat;
-			funcctx->user_fctx = rstat;
+			funcctx->user_fctx = entry;
 		}
 		else
 			funcctx->user_fctx = NULL;
@@ -2172,37 +2235,20 @@ get_packages_stats(PG_FUNCTION_ARGS)
 		SRF_RETURN_DONE(funcctx);
 
 	/* Get packages list */
-	rstat = (HASH_SEQ_STATUS *) funcctx->user_fctx;
+	entry = (PackageStatEntry *) funcctx->user_fctx;
+	rstat = entry->status;
+	if (!rstat)
+	{
+		if (entry->next_row == entry->num_rows)
+			SRF_RETURN_DONE(funcctx);
+		SRF_RETURN_NEXT(funcctx,
+						datumCopy(entry->rows[entry->next_row++], false, -1));
+	}
 
 	package = (Package *) hash_seq_search(rstat);
 	if (package != NULL)
 	{
-		Datum		values[2];
-		bool		nulls[2];
-		HeapTuple	tuple;
-		Datum		result;
-		Size		totalSpace = 0,
-					regularSpace = 0,
-					transactSpace = 0;
-
-		memset(nulls, 0, sizeof(nulls));
-
-		/* Fill data */
-		values[0] = PointerGetDatum(cstring_to_text(GetName(package)));
-
-		if (package->hctxRegular)
-			getMemoryTotalSpace(package->hctxRegular, 0, &regularSpace);
-		if (package->hctxTransact)
-			getMemoryTotalSpace(package->hctxTransact, 0, &transactSpace);
-
-		totalSpace = regularSpace + transactSpace;
-		values[1] = Int64GetDatum(totalSpace);
-
-		/* Data are ready */
-		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
-		result = HeapTupleGetDatum(tuple);
-
-		SRF_RETURN_NEXT(funcctx, result);
+		SRF_RETURN_NEXT(funcctx, package_stats_tuple(package, funcctx->tuple_desc));
 	}
 	else
 	{
@@ -2846,6 +2892,34 @@ rollbackSavepoint(TransObject *object, TransObjectType type, bool sub)
 		return;
 	}
 
+	if (type == TRANS_VARIABLE && sub)
+	{
+		Variable   *variable = (Variable *) object;
+		Package    *package = variable->package;
+		dlist_head *states = &package->transObject.states;
+
+		if (numOfRegVars(package) > 0 &&
+			isObjectChangedInCurrentTrans(&package->transObject) &&
+			dlist_has_next(states, dlist_head_node(states)))
+		{
+			PackState  *parent = (PackState *) dlist_container(TransState, node,
+										dlist_next_node(states, dlist_head_node(states)));
+
+			/* A surviving regular recreation must not revive removed values. */
+			if (!parent->state.is_valid && parent->is_removed
+#ifdef PGPRO_EE
+				&& parent->state.levels.atxlevel == getNestLevelATX()
+#endif
+				)
+			{
+				GetActualState(object)->is_valid = false;
+				variable->is_deleted = true;
+				releaseSavepoint(object, type, true);
+				return;
+			}
+		}
+	}
+
 	state = GetActualState(object);
 	removeState(object, type, state);
 
@@ -2876,6 +2950,13 @@ rollbackSavepoint(TransObject *object, TransObjectType type, bool sub)
 			else
 				/* ...or remove an object if it is no longer needed. */
 				removeObject(object, type);
+		}
+
+		else if (numOfRegVars((Package *) object) > 0)
+		{
+			/* Regular values created after removal survive this rollback. */
+			GetActualState(object)->is_valid = true;
+			GetPackState((Package *) object)->is_removed = false;
 		}
 
 		/*
@@ -3551,13 +3632,93 @@ pgvRestoreContext()
 #endif							/* PGPRO_EE */
 
 /*
- * Intercept execution during subtransaction processing
+ * Finish child-level hash registrations before the server discards them.
+ * Record scans retain entry pointers, protected from deletion by the full-scan
+ * guard. Stats scans retain result rows because package entries can disappear.
  */
+static void
+preserve_subtransaction_scans(Levels *levels)
+{
+	ListCell   *cell;
+
+	foreach(cell, variables_stats)
+	{
+		VariableStatEntry *entry = lfirst(cell);
+		HashRecordEntry *item;
+		MemoryContext context;
+
+		if (!VariableStatEntry_level_eq(entry, levels) || !entry->status)
+			continue;
+
+		context = GetMemoryChunkContext(entry);
+		entry->rows = MemoryContextAlloc(context,
+										mul_size(sizeof(HashRecordEntry *),
+												 hash_get_num_entries(entry->hash)));
+		while ((item = hash_seq_search(entry->status)) != NULL)
+		{
+			entry->rows[entry->num_rows++] = item;
+			CHECK_FOR_INTERRUPTS();
+		}
+		entry->status = NULL;
+	}
+
+	foreach(cell, packages_stats)
+	{
+		PackageStatEntry *entry = lfirst(cell);
+		Package    *package;
+		MemoryContext oldcontext;
+
+		if (!PackageStatEntry_level_eq(entry, levels) || !entry->status)
+			continue;
+
+		oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(entry));
+		entry->rows = palloc(mul_size(sizeof(Datum),
+									 hash_get_num_entries(packagesHash)));
+		while ((package = hash_seq_search(entry->status)) != NULL)
+		{
+			entry->rows[entry->num_rows++] = package_stats_tuple(package,
+																	 entry->tupdesc);
+			CHECK_FOR_INTERRUPTS();
+		}
+		entry->status = NULL;
+		MemoryContextSwitchTo(oldcontext);
+	}
+}
+
+static void
+promote_subtransaction_scans(Levels *levels)
+{
+	ListCell   *cell;
+
+	foreach(cell, variables_stats)
+	{
+		VariableStatEntry *entry = lfirst(cell);
+
+		if (VariableStatEntry_level_eq(entry, levels))
+			entry->levels.level--;
+	}
+	foreach(cell, packages_stats)
+	{
+		PackageStatEntry *entry = lfirst(cell);
+
+		if (PackageStatEntry_level_eq(entry, levels))
+			entry->levels.level--;
+	}
+}
+
+/* Intercept execution during subtransaction processing. */
 static void
 pgvSubTransCallback(SubXactEvent event, SubTransactionId mySubid,
 					SubTransactionId parentSubid, void *arg)
 {
 	Levels		levels;
+
+	levels.level = GetCurrentTransactionNestLevel();
+#ifdef PGPRO_EE
+	levels.atxlevel = getNestLevelATX();
+#endif
+	if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		preserve_subtransaction_scans(&levels);
 
 	if (changesStack)
 	{
@@ -3585,12 +3746,13 @@ pgvSubTransCallback(SubXactEvent event, SubTransactionId mySubid,
 		}
 	}
 
-	levels.level = GetCurrentTransactionNestLevel();
-#ifdef PGPRO_EE
-	levels.atxlevel = getNestLevelATX();
-#endif
-	remove_variables_level(&variables_stats, &levels);
-	remove_packages_level(&packages_stats, &levels);
+	if (event == SUBXACT_EVENT_COMMIT_SUB)
+		promote_subtransaction_scans(&levels);
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		remove_variables_level(&variables_stats, &levels);
+		remove_packages_level(&packages_stats, &levels);
+	}
 }
 
 /*

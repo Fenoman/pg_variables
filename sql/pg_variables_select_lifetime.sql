@@ -1,5 +1,54 @@
 SELECT pgv_free();
 
+-- Deleting a live key cannot invalidate an unfinished full scan. A missing
+-- key is harmless, and deletion is available once all full scans are done.
+DO $$
+DECLARE
+    first_cursor refcursor;
+    second_cursor refcursor;
+    row_value text;
+    blocked boolean;
+    remaining integer;
+    payload_size integer;
+BEGIN
+    FOREACH payload_size IN ARRAY ARRAY[32, 32768] LOOP
+        PERFORM pgv_insert('scan_delete', 'r', ROW(k, repeat('x', payload_size)))
+        FROM (VALUES (6), (40)) keys(k);
+        OPEN first_cursor FOR SELECT pgv_select('scan_delete', 'r')::text;
+        OPEN second_cursor FOR SELECT pgv_select('scan_delete', 'r')::text;
+        FETCH first_cursor INTO row_value;
+        FETCH second_cursor INTO row_value;
+        IF pgv_delete('scan_delete', 'r', 999) THEN
+            RAISE EXCEPTION 'missing key was deleted';
+        END IF;
+        CLOSE first_cursor;
+        blocked := false;
+        BEGIN
+            PERFORM pgv_delete('scan_delete', 'r', 40);
+        EXCEPTION WHEN object_in_use THEN
+            blocked := true;
+        END;
+        IF NOT blocked THEN
+            RAISE EXCEPTION 'delete invalidated an unfinished full scan';
+        END IF;
+        remaining := 0;
+        LOOP
+            FETCH second_cursor INTO row_value;
+            EXIT WHEN NOT FOUND;
+            remaining := remaining + 1;
+        END LOOP;
+        IF remaining <> 1 THEN
+            RAISE EXCEPTION 'rejected delete changed unread rows';
+        END IF;
+        IF NOT pgv_delete('scan_delete', 'r', 40) THEN
+            RAISE EXCEPTION 'completed scan still blocks deletion';
+        END IF;
+        CLOSE second_cursor;
+        PERFORM pgv_free();
+    END LOOP;
+END
+$$;
+
 -- pgv_select() by value returns a record that lives in the variable's own
 -- memory context. If the same record is updated in the same query -- freeing
 -- the old tuple -- while the returned Datum is still being materialised, the
@@ -126,3 +175,113 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- RELEASE preserves unread full, array and stats cursors across nested levels.
+SELECT pgv_free();
+CREATE FUNCTION pg_temp.pgv_fetch_text(c refcursor, n integer DEFAULT 2147483647)
+RETURNS text[] LANGUAGE plpgsql AS $$
+DECLARE
+    value text;
+    result text[] := ARRAY[]::text[];
+    i integer := 0;
+BEGIN
+    WHILE i < n LOOP
+        FETCH c INTO value;
+        EXIT WHEN NOT FOUND;
+        result := array_append(result, value);
+        i := i + 1;
+    END LOOP;
+    RETURN result;
+END
+$$;
+CREATE TEMP TABLE promoted_seen(name text PRIMARY KEY, rows text[]);
+BEGIN;
+DO $$
+BEGIN
+    PERFORM pgv_insert('promoted', 'regular', ROW(i), false)
+    FROM generate_series(1, 5) i;
+    PERFORM pgv_insert('promoted', 'transactional', ROW(i), true)
+    FROM generate_series(1, 5) i;
+    PERFORM pgv_set('promoted_stats', 'v', 1);
+END
+$$;
+SAVEPOINT outer_level;
+DECLARE promoted_full CURSOR FOR SELECT pgv_select('promoted', 'regular')::text;
+DECLARE promoted_tx CURSOR FOR SELECT pgv_select('promoted', 'transactional')::text;
+DECLARE promoted_array CURSOR FOR SELECT pgv_select('promoted', 'regular', ARRAY[1,2,3,4,5])::text;
+DECLARE promoted_stats CURSOR FOR SELECT pgv_stats()::text;
+INSERT INTO promoted_seen VALUES
+    ('promoted_full', pg_temp.pgv_fetch_text('promoted_full', 1)),
+    ('promoted_tx', pg_temp.pgv_fetch_text('promoted_tx', 1)),
+    ('promoted_array', pg_temp.pgv_fetch_text('promoted_array', 1)),
+    ('promoted_stats', pg_temp.pgv_fetch_text('promoted_stats', 1));
+SAVEPOINT inner_level;
+DECLARE promoted_nested CURSOR FOR SELECT pgv_select('promoted', 'regular')::text;
+DECLARE promoted_early_close CURSOR FOR SELECT pgv_select('promoted', 'regular')::text;
+INSERT INTO promoted_seen VALUES
+    ('promoted_nested', pg_temp.pgv_fetch_text('promoted_nested', 1)),
+    ('promoted_early_close', pg_temp.pgv_fetch_text('promoted_early_close', 1));
+CLOSE promoted_early_close;
+RELEASE inner_level;
+RELEASE outer_level;
+DO $$
+DECLARE
+    cursor_name text;
+    actual text[];
+    rejected boolean := false;
+BEGIN
+    BEGIN
+        PERFORM pgv_delete('promoted', 'regular', 1);
+    EXCEPTION WHEN object_in_use THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'promoted full scan did not protect its unread entries';
+    END IF;
+    PERFORM pgv_insert('promoted', 'regular', ROW(i), false)
+    FROM generate_series(100, 200) i;
+    FOREACH cursor_name IN ARRAY ARRAY['promoted_full', 'promoted_tx',
+                                       'promoted_array', 'promoted_nested'] LOOP
+        SELECT array_agg(value ORDER BY value) INTO actual
+        FROM unnest((SELECT rows FROM promoted_seen WHERE name = cursor_name) ||
+                    pg_temp.pgv_fetch_text(cursor_name::refcursor)) AS t(value);
+        IF actual IS DISTINCT FROM ARRAY['(1)', '(2)', '(3)', '(4)', '(5)'] THEN
+            RAISE EXCEPTION 'RELEASE changed unread rows for %: %', cursor_name, actual;
+        END IF;
+    END LOOP;
+    SELECT array_agg(split_part(ltrim(value, '('), ',', 1) ORDER BY value)
+    INTO actual
+    FROM unnest((SELECT rows FROM promoted_seen WHERE name = 'promoted_stats') ||
+                pg_temp.pgv_fetch_text('promoted_stats')) AS t(value);
+    IF actual IS DISTINCT FROM ARRAY['promoted', 'promoted_stats'] THEN
+        RAISE EXCEPTION 'RELEASE changed unread stats rows: %', actual;
+    END IF;
+END
+$$;
+CLOSE promoted_full;
+CLOSE promoted_tx;
+CLOSE promoted_array;
+CLOSE promoted_stats;
+CLOSE promoted_nested;
+SAVEPOINT aborted_level;
+DECLARE aborted_full CURSOR FOR SELECT pgv_select('promoted', 'regular')::text;
+INSERT INTO promoted_seen VALUES ('aborted_full', pg_temp.pgv_fetch_text('aborted_full', 1));
+ROLLBACK TO aborted_level;
+DO $$
+BEGIN
+    IF NOT pgv_delete('promoted', 'regular', 100) THEN
+        RAISE EXCEPTION 'aborted cursor left an active scan';
+    END IF;
+END
+$$;
+COMMIT;
+DO $$
+BEGIN
+    IF pgv_exists('promoted', 'transactional') THEN
+        RAISE EXCEPTION 'released cursor retained transactional values after commit';
+    END IF;
+END
+$$;
+DROP TABLE promoted_seen;
+DROP FUNCTION pg_temp.pgv_fetch_text(refcursor, integer);
+SELECT pgv_free();

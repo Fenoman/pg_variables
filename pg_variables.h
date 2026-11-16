@@ -201,6 +201,7 @@ extern void check_record_key(Variable *variable, Oid typid);
 extern void insert_record(Variable *variable, HeapTupleHeader tupleHeader);
 extern bool update_record(Variable *variable, HeapTupleHeader tupleHeader);
 extern bool delete_record(Variable *variable, Datum value, bool is_null);
+extern void check_record_delete_allowed(Variable *variable);
 extern void insert_record_copy(RecordVar *dest_record, Datum src_tuple,
 							   Variable *variable);
 extern bool removeObject(TransObject *object, TransObjectType type);

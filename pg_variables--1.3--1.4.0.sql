@@ -174,26 +174,57 @@ LANGUAGE C VOLATILE;
 
 -- Obsolete functions removed from the 1.4.0 API.
 
-DROP FUNCTION IF EXISTS pgv_set(package text, name text, value anynonarray);
-DROP FUNCTION IF EXISTS pgv_set_int(package text, name text, value int);
-DROP FUNCTION IF EXISTS pgv_set_text(package text, name text, value text);
-DROP FUNCTION IF EXISTS pgv_set_numeric(package text, name text, value numeric);
-DROP FUNCTION IF EXISTS pgv_set_timestamp(package text, name text, value timestamp);
-DROP FUNCTION IF EXISTS pgv_set_timestamptz(package text, name text, value timestamptz);
-DROP FUNCTION IF EXISTS pgv_set_date(package text, name text, value date);
-DROP FUNCTION IF EXISTS pgv_set_jsonb(package text, name text, value jsonb);
-DROP FUNCTION IF EXISTS pgv_insert(package text, name text, r record);
-DROP FUNCTION IF EXISTS pgv_count(package text, name text);
-DROP FUNCTION IF EXISTS pgv_select_support(internal);
-DROP FUNCTION IF EXISTS pgv_first(package text, name text, value anyelement);
-DROP FUNCTION IF EXISTS pgv_last(package text, name text, value anyelement);
-DROP FUNCTION IF EXISTS pgv_next(package text, name text, value anyelement);
-DROP FUNCTION IF EXISTS pgv_prior(package text, name text, value anyelement);
-DROP FUNCTION IF EXISTS pgv_get_elem(package text, name text, value integer, elem_type anyelement);
-DROP FUNCTION IF EXISTS pgv_get_elem(package text, name text, value text, elem_type anyelement);
-DROP FUNCTION IF EXISTS pgv_set_elem(package text, name text, value integer, elem anyelement, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_set_elem(package text, name text, value text, elem anyelement, is_transactional bool);
-DROP FUNCTION IF EXISTS pgv_exists_elem(package text, name text, value integer);
-DROP FUNCTION IF EXISTS pgv_exists_elem(package text, name text, value text);
-DROP FUNCTION IF EXISTS pgv_remove_elem(package text, name text, value integer);
-DROP FUNCTION IF EXISTS pgv_remove_elem(package text, name text, value text);
+-- Obsolete names can also belong to user functions outside this extension.
+DO $pg_variables_upgrade$
+DECLARE
+    function_signature text;
+    function_oid oid;
+    extension_oid oid;
+BEGIN
+    SELECT oid INTO STRICT extension_oid
+    FROM pg_catalog.pg_extension WHERE extname = 'pg_variables';
+    FOREACH function_signature IN ARRAY ARRAY[
+        'pgv_set(text,text,anynonarray)',
+        'pgv_set_int(text,text,int)',
+        'pgv_set_text(text,text,text)',
+        'pgv_set_numeric(text,text,numeric)',
+        'pgv_set_timestamp(text,text,timestamp)',
+        'pgv_set_timestamptz(text,text,timestamptz)',
+        'pgv_set_date(text,text,date)',
+        'pgv_set_jsonb(text,text,jsonb)',
+        'pgv_insert(text,text,record)',
+        'pgv_count(text,text)',
+        'pgv_select_support(internal)',
+        'pgv_first(text,text,anyelement)',
+        'pgv_last(text,text,anyelement)',
+        'pgv_next(text,text,anyelement)',
+        'pgv_prior(text,text,anyelement)',
+        'pgv_get_elem(text,text,integer,anyelement)',
+        'pgv_get_elem(text,text,text,anyelement)',
+        'pgv_set_elem(text,text,integer,anyelement,bool)',
+        'pgv_set_elem(text,text,text,anyelement,bool)',
+        'pgv_exists_elem(text,text,integer)',
+        'pgv_exists_elem(text,text,text)',
+        'pgv_remove_elem(text,text,integer)',
+        'pgv_remove_elem(text,text,text)'
+    ] LOOP
+        function_oid := pg_catalog.to_regprocedure(function_signature);
+        IF function_oid IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend
+            WHERE classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+              AND objid = function_oid AND objsubid = 0
+              AND refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+              AND refobjid = extension_oid AND deptype = 'e'
+        ) THEN
+            RAISE EXCEPTION 'cannot remove function %: it is not a member of pg_variables',
+                            function_oid::pg_catalog.regprocedure
+                USING ERRCODE = '55000';
+        END IF;
+        EXECUTE pg_catalog.format('DROP FUNCTION %s',
+                                  function_oid::pg_catalog.regprocedure);
+    END LOOP;
+END
+$pg_variables_upgrade$;

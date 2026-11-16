@@ -97,3 +97,71 @@ DROP VIEW upgrade_dep_exists;
 DROP VIEW upgrade_dep_select;
 DROP FUNCTION upgrade_dep_get();
 DROP EXTENSION pg_variables;
+
+-- Each direct upgrade preserves foreign functions and rolls back on conflict.
+-- Surviving extension functions retain their identity and explicit privileges.
+CREATE SCHEMA upgrade_relocated;
+DO $$
+DECLARE
+    source_version text;
+    target_schema text;
+    rejected boolean;
+    foreign_oid oid;
+    surviving_oid oid;
+    surviving_acl aclitem[];
+    foreign_value integer;
+BEGIN
+    FOREACH target_schema IN ARRAY ARRAY['public', 'upgrade_relocated'] LOOP
+        FOREACH source_version IN ARRAY ARRAY['1.0', '1.1', '1.2', '1.3'] LOOP
+            EXECUTE format('CREATE EXTENSION pg_variables SCHEMA %I VERSION %L',
+                           target_schema, '1.0');
+            IF source_version <> '1.0' THEN
+                EXECUTE format('ALTER EXTENSION pg_variables UPDATE TO %L',
+                               CASE WHEN source_version = '1.3' THEN '1.2'
+                                    ELSE source_version END);
+            END IF;
+            IF source_version = '1.3' THEN
+                UPDATE pg_extension SET extversion = '1.3'
+                WHERE extname = 'pg_variables';
+            END IF;
+            EXECUTE format('CREATE FUNCTION %I.pgv_count(text,text) RETURNS integer '
+                           'LANGUAGE sql AS %L', target_schema, 'SELECT 42');
+            foreign_oid := to_regprocedure(format('%I.pgv_count(text,text)',
+                                                 target_schema));
+            surviving_oid := to_regprocedure(format('%I.pgv_exists(text,text)',
+                                                   target_schema));
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',
+                           surviving_oid::regprocedure);
+            SELECT proacl INTO surviving_acl FROM pg_proc WHERE oid = surviving_oid;
+            rejected := false;
+            BEGIN
+                ALTER EXTENSION pg_variables UPDATE TO '1.4.0';
+            EXCEPTION WHEN object_not_in_prerequisite_state THEN
+                rejected := true;
+            END;
+            IF NOT rejected OR
+               to_regprocedure(format('%I.pgv_count(text,text)', target_schema))
+               IS DISTINCT FROM foreign_oid OR
+               (SELECT extversion FROM pg_extension WHERE extname = 'pg_variables')
+               IS DISTINCT FROM source_version THEN
+                RAISE EXCEPTION 'upgrade changed a foreign function or failed to roll back';
+            END IF;
+            EXECUTE format('SELECT %I.pgv_count(%L,%L)', target_schema, 'p', 'v')
+            INTO foreign_value;
+            IF foreign_value <> 42 THEN
+                RAISE EXCEPTION 'foreign function body changed';
+            END IF;
+            EXECUTE format('DROP FUNCTION %s', foreign_oid::regprocedure);
+            ALTER EXTENSION pg_variables UPDATE TO '1.4.0';
+            IF to_regprocedure(format('%I.pgv_exists(text,text)', target_schema))
+               IS DISTINCT FROM surviving_oid OR
+               (SELECT proacl FROM pg_proc WHERE oid = surviving_oid)
+               IS DISTINCT FROM surviving_acl THEN
+                RAISE EXCEPTION 'upgrade changed a surviving function identity or ACL';
+            END IF;
+            DROP EXTENSION pg_variables;
+        END LOOP;
+    END LOOP;
+END
+$$;
+DROP SCHEMA upgrade_relocated;

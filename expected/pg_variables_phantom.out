@@ -4,6 +4,55 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Regular recreation survives rollback without reviving removed values.
+-- An outer rollback still restores transactional data from before removal.
+DO $$
+BEGIN
+    PERFORM pgv_set('recreated', 'old_regular', 1, false);
+    PERFORM pgv_set('recreated', 'old_transactional', 11, true);
+    BEGIN
+        PERFORM pgv_remove('recreated');
+        BEGIN
+            PERFORM pgv_set('recreated', 'new_regular', 2, false);
+            PERFORM pgv_set('recreated', 'new_transactional', 22, true);
+            RAISE EXCEPTION USING ERRCODE = 'PZ010';
+        EXCEPTION WHEN SQLSTATE 'PZ010' THEN
+            NULL;
+        END;
+        IF pgv_get('recreated', 'new_regular', NULL::integer, false)
+           IS DISTINCT FROM 2 OR
+           pgv_exists('recreated', 'old_regular') OR
+           pgv_exists('recreated', 'old_transactional') OR
+           pgv_exists('recreated', 'new_transactional') THEN
+            RAISE EXCEPTION 'recreation rollback lost regular or revived removed data';
+        END IF;
+        PERFORM pgv_set('recreated', 'later_transactional', 33, true);
+        RAISE EXCEPTION USING ERRCODE = 'PZ011';
+    EXCEPTION WHEN SQLSTATE 'PZ011' THEN
+        NULL;
+    END;
+    IF pgv_get('recreated', 'new_regular', NULL::integer, false)
+       IS DISTINCT FROM 2 OR
+       pgv_get('recreated', 'old_transactional', NULL::integer, false)
+       IS DISTINCT FROM 11 OR pgv_exists('recreated', 'later_transactional') THEN
+        RAISE EXCEPTION 'outer rollback did not restore the proper transaction state';
+    END IF;
+END
+$$;
+DO $$
+BEGIN
+    IF pgv_get('recreated', 'new_regular', NULL::integer, false)
+       IS DISTINCT FROM 2 OR pgv_exists('recreated', 'old_transactional') THEN
+        RAISE EXCEPTION 'commit lost regular data or retained transactional data';
+    END IF;
+END
+$$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
 -- Revalidating a removed transactional variable inside a subtransaction must
 -- create a package savepoint before bumping trans_var_num. Otherwise ROLLBACK
 -- TO cannot restore the counter and leaves a phantom package that pgv_exists()

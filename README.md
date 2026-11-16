@@ -228,6 +228,11 @@ Function | Returns | Description
 `pgv_select(package text, name text, value anynonarray)` | `record` | Returns the record with the corresponding primary key (the first column of **r** is a primary key).
 `pgv_select(package text, name text, value anyarray)` | `set of record` | Returns the variable collection records with the corresponding primary keys (the first column of **r** is a primary key).
 
+Deleting an existing record while a full `pgv_select(package, name)` scan of
+the same collection state is unfinished raises an error. Finish or close the
+scan before deleting records. A missing key still returns `false`, and keyed
+or array-key selectors do not impose this restriction.
+
 ### Miscellaneous functions
 
 Function | Returns | Description
@@ -363,6 +368,15 @@ PostgreSQL materializes holdable cursors before transaction end.  Therefore, a
 `DECLARE CURSOR WITH HOLD` query over transaction-local variables can still fetch
 the materialized in-transaction snapshot after `COMMIT`, even though subsequent
 `pgv_*` calls see the discarded or restored state.
+
+Active record and statistics cursors continue after `RELEASE SAVEPOINT`
+while their source collection state remains alive.
+For a full record scan opened inside the savepoint, RELEASE retains references
+to the unread entries. Subsequent inserts are excluded from that scan, updates
+to retained entries remain visible, and the deletion restriction above still
+applies. Unread statistics rows are captured at RELEASE. This extra storage is
+used only for scans crossing a savepoint boundary. Removing or replacing the
+source collection state still ends its record scans.
 
 Following use cases describe behavior of transactional variables:
 
