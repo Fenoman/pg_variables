@@ -165,3 +165,31 @@ BEGIN
 END
 $$;
 DROP SCHEMA upgrade_relocated;
+
+-- Explicit legacy upgrades must preserve detached functions too.
+CREATE SCHEMA legacy_guard;
+CREATE EXTENSION pg_variables SCHEMA legacy_guard VERSION '1.0';
+ALTER EXTENSION pg_variables DROP FUNCTION legacy_guard.pgv_list();
+CREATE OR REPLACE FUNCTION legacy_guard.pgv_list() RETURNS TABLE(package text, name text)
+LANGUAGE sql AS $$ SELECT 'owner'::text, 'custom'::text $$;
+DO $$
+DECLARE
+    rejected boolean := false;
+    original_oid oid := 'legacy_guard.pgv_list()'::regprocedure;
+BEGIN
+    BEGIN
+        ALTER EXTENSION pg_variables UPDATE TO '1.1';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        rejected := true;
+    END;
+    IF NOT rejected OR 'legacy_guard.pgv_list()'::regprocedure::oid <> original_oid OR
+       (SELECT extversion FROM pg_extension WHERE extname = 'pg_variables') <> '1.0' THEN
+        RAISE EXCEPTION 'legacy update removed a foreign function';
+    END IF;
+    IF (SELECT name FROM legacy_guard.pgv_list()) IS DISTINCT FROM 'custom' THEN
+        RAISE EXCEPTION 'legacy update changed the foreign function body';
+    END IF;
+END $$;
+DROP EXTENSION pg_variables;
+DROP FUNCTION legacy_guard.pgv_list();
+DROP SCHEMA legacy_guard;

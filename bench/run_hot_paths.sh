@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQL_FILE="${SCRIPT_DIR}/sql/hot_paths.sql"
@@ -12,10 +13,14 @@ TEXT_ITERATIONS="${TEXT_ITERATIONS:-5000000}"
 FIXED_ITERATIONS="${FIXED_ITERATIONS:-5000000}"
 RECORD_ITERATIONS="${RECORD_ITERATIONS:-10000}"
 ARRAY_ITERATIONS="${ARRAY_ITERATIONS:-250000}"
-REPEATS="${REPEATS:-3}"
+REPEATS="${REPEATS:-5}"
 RUN_TYPED="${RUN_TYPED:-1}"
 RUN_RECORDS="${RUN_RECORDS:-1}"
 RUN_ARRAYS="${RUN_ARRAYS:-1}"
+
+for name in ITERATIONS TEXT_ITERATIONS FIXED_ITERATIONS RECORD_ITERATIONS ARRAY_ITERATIONS REPEATS; do
+	[[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be a positive integer" >&2; exit 2; }
+done
 
 case "${RUN_TYPED}" in
 	1|true|on|yes) RUN_TYPED_SQL=true ;;
@@ -36,11 +41,19 @@ case "${RUN_ARRAYS}" in
 esac
 
 mkdir -p "${RESULTS_DIR}"
-OUT="${RESULTS_DIR}/hot_paths_$(date +%Y%m%d_%H%M%S).out"
+OUT="$(mktemp "${RESULTS_DIR}/hot_paths_$(date +%Y%m%d_%H%M%S)_XXXXXX.out")"
+RAW_DIR="${OUT%.out}.raw"
+mkdir "$RAW_DIR"
+trap 'rc=$?; printf "%s\n" "$rc" > "$RAW_DIR/exit-code"' EXIT
 
 # Provenance so before/after comparisons are pinned to a build.
-GIT_REV="$(git -C "${SCRIPT_DIR}/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "${SCRIPT_DIR}/.." diff --quiet 2>/dev/null || GIT_REV="${GIT_REV} (dirty)"
+GIT_REV="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || echo unknown)"
+if git -C "${SCRIPT_DIR}/.." status --porcelain --untracked-files=all > "$RAW_DIR/git-status" 2> "$RAW_DIR/git-error"; then
+	[[ ! -s "$RAW_DIR/git-status" ]] || GIT_REV="${GIT_REV} (dirty)"
+else
+	GIT_REV="${GIT_REV} (status unavailable)"
+fi
+sha256sum "$SCRIPT_DIR/run_hot_paths.sh" "$SQL_FILE" > "$RAW_DIR/workloads.sha256"
 
 echo "Writing benchmark output to ${OUT}" >&2
 {
@@ -48,17 +61,18 @@ echo "Writing benchmark output to ${OUT}" >&2
 	echo "# dbname:     ${DBNAME}"
 	echo "# iterations: ${ITERATIONS}  text: ${TEXT_ITERATIONS}  fixed: ${FIXED_ITERATIONS}  record: ${RECORD_ITERATIONS}  array: ${ARRAY_ITERATIONS}"
 	echo "# repeats:    ${REPEATS}   (compare the median across runs)"
+	echo "# raw logs:   ${RAW_DIR}"
 } | tee "${OUT}"
 
 # Repeat the whole run REPEATS times; each \timing line is one measurement, so
 # the median across runs is what to compare. A single run is dominated by cache
 # warm-up and one-off noise.
-for run in $(seq 1 "${REPEATS}"); do
+for ((run = 1; run <= REPEATS; run++)); do
 	echo "=== run ${run}/${REPEATS} ===" | tee -a "${OUT}"
 	# PSQL may intentionally contain extra arguments, for example:
 	#   PSQL="sudo -u postgres psql" ./bench/run_hot_paths.sh
 	# shellcheck disable=SC2086
-	${PSQL} -X \
+	if ${PSQL} -X -v ON_ERROR_STOP=1 \
 		-v iterations="${ITERATIONS}" \
 		-v text_iterations="${TEXT_ITERATIONS}" \
 		-v fixed_iterations="${FIXED_ITERATIONS}" \
@@ -68,5 +82,8 @@ for run in $(seq 1 "${REPEATS}"); do
 		-v run_records="${RUN_RECORDS_SQL}" \
 		-v run_arrays="${RUN_ARRAYS_SQL}" \
 		-d "${DBNAME}" \
-		-f "${SQL_FILE}" | tee -a "${OUT}"
+		-f "${SQL_FILE}" > "$RAW_DIR/run.$run.out" 2> "$RAW_DIR/run.$run.stderr"; then rc=0; else rc=$?; fi
+	printf '%s\n' "$rc" > "$RAW_DIR/run.$run.rc"
+	cat "$RAW_DIR/run.$run.out" "$RAW_DIR/run.$run.stderr" | tee -a "$OUT"
+	[[ "$rc" == 0 ]] || exit "$rc"
 done

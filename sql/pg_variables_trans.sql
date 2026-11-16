@@ -724,7 +724,7 @@ DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_remove('test');
 FETCH 1 in r1_cur;
 ROLLBACK;
-SELECT pgv_select('test');
+SELECT pgv_select('test', 'y');
 
 SELECT pgv_free();
 ---
@@ -744,7 +744,7 @@ DECLARE r1_cur CURSOR FOR SELECT pgv_select('test', 'y');
 SELECT pgv_free();
 FETCH 1 in r1_cur;
 ROLLBACK;
-SELECT pgv_select('test');
+SELECT pgv_select('test', 'y');
 
 SELECT pgv_free();
 ---

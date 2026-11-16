@@ -12,7 +12,7 @@ install:
     - docker-compose build
 
 script:
-    - docker-compose run $(bash <(curl -s https://codecov.io/env)) tests
+    - docker-compose run --rm tests
 
 notifications:
     email:
@@ -20,6 +20,12 @@ notifications:
         on_failure: always
 
 env:
+    - PG_VERSION=18 LEVEL=nightmare
+    - PG_VERSION=18 LEVEL=hardcore
+    - PG_VERSION=18
+    - PG_VERSION=17 LEVEL=nightmare
+    - PG_VERSION=17 LEVEL=hardcore
+    - PG_VERSION=17
     - PG_VERSION=16 LEVEL=nightmare
     - PG_VERSION=16 LEVEL=hardcore
     - PG_VERSION=16

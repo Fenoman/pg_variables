@@ -35,6 +35,7 @@
 
 typedef struct RecordVar
 {
+	struct Variable *variable;
 	HTAB	   *rhash;
 	TupleDesc	tupdesc;
 	/* Memory context for records hash table for easy memory release */
@@ -84,13 +85,15 @@ typedef struct PackState
 {
 	TransState	state;
 	unsigned long trans_var_num;	/* Number of valid transactional variables */
-	bool		is_removed;		/* Package was explicitly removed */
+	bool		is_removed;		/* Transactional contents were explicitly removed */
 }			PackState;
 
 /* List node that stores one of the variable's states */
 typedef struct VarState
 {
 	TransState	state;
+	/* Keep a package-removal tombstone until that savepoint is rolled back. */
+	int			package_removal_level;
 	union
 	{
 		ScalarVar	scalar;
@@ -155,10 +158,7 @@ typedef struct HashRecordKey
 {
 	Datum		value;
 	bool		is_null;
-	/* Hash function info */
-	FmgrInfo   *hash_proc;
-	/* Match function info */
-	FmgrInfo   *cmp_proc;
+	RecordVar  *record;
 }			HashRecordKey;
 
 typedef struct HashRecordEntry
@@ -188,6 +188,7 @@ typedef struct ChangesStackNode
 	dlist_head *changedVarsList;
 	dlist_head *changedPacksList;
 	MemoryContext ctx;
+	int			level;
 }			ChangesStackNode;
 
 /* pg_variables.c */
@@ -202,6 +203,9 @@ extern void insert_record(Variable *variable, HeapTupleHeader tupleHeader);
 extern bool update_record(Variable *variable, HeapTupleHeader tupleHeader);
 extern bool delete_record(Variable *variable, Datum value, bool is_null);
 extern void check_record_delete_allowed(Variable *variable);
+extern void check_record_callback_mutation(Package *package, Variable *variable);
+extern void check_record_callback_name(Package *package, const char *var_name);
+extern void check_record_callback_text(text *package_name, text *var_name);
 extern void insert_record_copy(RecordVar *dest_record, Datum src_tuple,
 							   Variable *variable);
 extern bool removeObject(TransObject *object, TransObjectType type);

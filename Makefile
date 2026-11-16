@@ -35,3 +35,5 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+pg_variables.o pg_variables_record.o pg_variables.bc pg_variables_record.bc: pg_variables.h

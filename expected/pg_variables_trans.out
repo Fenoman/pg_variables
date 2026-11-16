@@ -2641,11 +2641,8 @@ SELECT pgv_remove('test');
 FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
-SELECT pgv_select('test');
-ERROR:  function pgv_select(unknown) does not exist
-LINE 1: SELECT pgv_select('test');
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+SELECT pgv_select('test', 'y');
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------
@@ -2691,11 +2688,8 @@ SELECT pgv_free();
 FETCH 1 in r1_cur;
 ERROR:  unrecognized package "test"
 ROLLBACK;
-SELECT pgv_select('test');
-ERROR:  function pgv_select(unknown) does not exist
-LINE 1: SELECT pgv_select('test');
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+SELECT pgv_select('test', 'y');
+ERROR:  unrecognized package "test"
 SELECT pgv_free();
  pgv_free 
 ----------

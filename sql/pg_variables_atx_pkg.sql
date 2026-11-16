@@ -351,3 +351,270 @@ COMMIT;
 DROP FUNCTION pgv_atx_set(int);
 DROP FUNCTION pgv_atx_count(refcursor);
 SELECT pgv_free();
+
+SELECT pgv_free();
+BEGIN;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_new', 'v', 1, true);
+COMMIT;
+SELECT pgv_exists('atx_new') AS package_exists, pgv_exists('atx_new', 'v') AS variable_exists;
+COMMIT;
+DO $$ BEGIN
+ IF pgv_exists('atx_new') THEN RAISE EXCEPTION 'ATX left an empty package visible'; END IF;
+END $$;
+
+SELECT pgv_free();
+BEGIN;
+SELECT pgv_set('atx_recreate', 'old_tx', 10, true);
+SELECT pgv_remove('atx_recreate');
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_recreate', 'new_regular', 99, false);
+COMMIT;
+SELECT pgv_get('atx_recreate', 'old_tx', NULL::integer, false) AS value_after_atx;
+COMMIT;
+DO $$ BEGIN
+ IF pgv_exists('atx_recreate', 'old_tx') OR
+    pgv_get('atx_recreate', 'new_regular', NULL::integer, false) IS DISTINCT FROM 99 THEN
+  RAISE EXCEPTION 'ATX recreation retained a removed value or lost regular data';
+ END IF;
+END $$;
+SELECT pgv_free();
+
+SELECT pgv_free();
+-- Rolling back the parent's removal restores its original transactional data.
+BEGIN;
+SELECT pgv_set('atx_rollback', 'old_tx', 10, true);
+SAVEPOINT before_removal;
+SELECT pgv_remove('atx_rollback');
+SAVEPOINT after_removal;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_rollback', 'regular', 99, false);
+ROLLBACK;
+DO $$ BEGIN
+ IF pgv_exists('atx_rollback', 'old_tx') OR
+    pgv_get('atx_rollback', 'old_tx', NULL::text, false) IS NOT NULL OR
+    EXISTS (SELECT FROM pgv_list() WHERE package = 'atx_rollback' AND name = 'old_tx') THEN
+  RAISE EXCEPTION 'ATX revived parent-removed data';
+ END IF;
+END $$;
+ROLLBACK TO before_removal;
+DO $$ BEGIN
+ IF pgv_get('atx_rollback', 'old_tx', NULL::integer) IS DISTINCT FROM 10 OR
+    pgv_get('atx_rollback', 'regular', NULL::integer) IS DISTINCT FROM 99 THEN
+  RAISE EXCEPTION 'parent rollback did not restore its transactional data';
+ END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+-- Inner ATX cleanup restores the outer ATX, then outer cleanup removes it.
+BEGIN;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('nested_empty', 'outer_tx', 1, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_set('nested_empty', 'inner_tx', 2, true);
+COMMIT;
+DO $$ BEGIN
+ IF NOT pgv_exists('nested_empty', 'outer_tx') OR pgv_exists('nested_empty', 'inner_tx') THEN
+  RAISE EXCEPTION 'inner ATX did not restore the outer state';
+ END IF;
+END $$;
+COMMIT;
+COMMIT;
+DO $$ BEGIN
+ IF pgv_exists('nested_empty') THEN RAISE EXCEPTION 'nested ATX left an empty package'; END IF;
+END $$;
+-- Removing new child packages preserves an already active parent stats scan.
+CREATE OR REPLACE FUNCTION pgv_empty_atx(n integer) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN AUTONOMOUS
+    PERFORM pgv_set('empty_atx_' || n, 'v', n, true);
+END $$;
+DO $$ BEGIN
+ FOR i IN 1..10 LOOP PERFORM pgv_set('parent_stats_' || i, 'v', i, false); END LOOP;
+END $$;
+BEGIN;
+DECLARE parent_stats_cursor CURSOR FOR SELECT pgv_stats();
+MOVE 1 FROM parent_stats_cursor;
+SELECT count(*) FROM (SELECT pgv_empty_atx(i) FROM generate_series(1, 100) i) s;
+DO $$
+DECLARE r record; n integer := 0; c refcursor := 'parent_stats_cursor';
+BEGIN
+ LOOP
+  FETCH c INTO r;
+  EXIT WHEN NOT FOUND;
+  n := n + 1;
+ END LOOP;
+ IF n <> 9 OR (SELECT count(*) FROM pgv_stats()) <> 10 THEN
+  RAISE EXCEPTION 'ATX cleanup changed the parent scan or retained empty packages: %', n;
+ END IF;
+END $$;
+COMMIT;
+DROP FUNCTION pgv_empty_atx(integer);
+SELECT pgv_free();
+
+-- Record callbacks may use autonomous transactions for independent work while
+-- active-collection mutations raise object_in_use without corrupting parent state.
+CREATE SCHEMA atx_cb_s;
+CREATE TYPE atx_cb_s.k_enum AS ENUM ('a', 'b');
+CREATE FUNCTION atx_cb_s.try_atx() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN AUTONOMOUS
+    CASE current_setting('pgv_test.atx_cb_mode', true)
+      WHEN 'independent' THEN
+        PERFORM pgv_set('atx_cb_indep', 'reg_v', 42, false);
+        PERFORM pgv_set('atx_cb_indep', 'tx_v', 99, true);
+      WHEN 'mutate_active' THEN
+        PERFORM pgv_set('rec_atx_cb', 'r', 1, false);
+      WHEN 'remove_var' THEN
+        PERFORM pgv_remove('rec_atx_cb', 'r');
+      WHEN 'update_active' THEN
+        PERFORM pgv_update('rec_atx_cb', 'r', ROW('a'::atx_cb_s.k_enum, 99));
+      WHEN 'delete_active' THEN
+        PERFORM pgv_delete('rec_atx_cb', 'r', 'a'::atx_cb_s.k_enum);
+      WHEN 'remove_pkg' THEN
+        PERFORM pgv_remove('rec_atx_cb');
+      WHEN 'free_all' THEN
+        PERFORM pgv_free();
+      ELSE NULL;
+    END CASE;
+END $$;
+CREATE FUNCTION atx_cb_s.k_cmp(atx_cb_s.k_enum, atx_cb_s.k_enum)
+RETURNS integer LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+BEGIN
+    PERFORM atx_cb_s.try_atx();
+    RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END;
+END $$;
+CREATE FUNCTION atx_cb_s.k_hash(atx_cb_s.k_enum)
+RETURNS integer LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+BEGIN
+    PERFORM atx_cb_s.try_atx();
+    RETURN 1;
+END $$;
+CREATE OPERATOR CLASS atx_cb_s.k_ops DEFAULT FOR TYPE atx_cb_s.k_enum USING hash AS
+    OPERATOR 1 = (anyenum, anyenum),
+    FUNCTION 1 atx_cb_s.k_hash(atx_cb_s.k_enum);
+CREATE OPERATOR CLASS atx_cb_s.k_btree_ops DEFAULT FOR TYPE atx_cb_s.k_enum USING btree AS
+    OPERATOR 1 < (anyenum, anyenum),
+    OPERATOR 2 <= (anyenum, anyenum),
+    OPERATOR 3 = (anyenum, anyenum),
+    OPERATOR 4 >= (anyenum, anyenum),
+    OPERATOR 5 > (anyenum, anyenum),
+    FUNCTION 1 atx_cb_s.k_cmp(atx_cb_s.k_enum, atx_cb_s.k_enum);
+BEGIN;
+SELECT pgv_set('parent_keep', 'tx_val', 777, true);
+SET LOCAL pgv_test.atx_cb_mode = 'independent';
+SELECT pgv_insert('rec_atx_cb', 'r', ROW('a'::atx_cb_s.k_enum, 10), true);
+DO $$
+DECLARE
+    m text;
+BEGIN
+    IF pgv_get('atx_cb_indep', 'reg_v', NULL::integer, false) IS DISTINCT FROM 42 OR
+       pgv_exists('atx_cb_indep', 'tx_v') OR
+       pgv_get('parent_keep', 'tx_val', NULL::integer, false) IS DISTINCT FROM 777 THEN
+        RAISE EXCEPTION 'independent ATX inside callback corrupted state';
+    END IF;
+    FOREACH m IN ARRAY ARRAY['mutate_active', 'remove_var', 'update_active', 'delete_active', 'remove_pkg', 'free_all'] LOOP
+        PERFORM set_config('pgv_test.atx_cb_mode', m, true);
+        BEGIN
+            PERFORM pgv_insert('rec_atx_cb', 'r', ROW('b'::atx_cb_s.k_enum, 20), true);
+            RAISE EXCEPTION 'expected object_in_use for mode %', m;
+        EXCEPTION WHEN object_in_use THEN
+            NULL;
+        END;
+        IF pgv_get('parent_keep', 'tx_val', NULL::integer, false) IS DISTINCT FROM 777 OR
+           (SELECT count(*) FROM (SELECT pgv_select('rec_atx_cb', 'r')) s) <> 1 THEN
+            RAISE EXCEPTION 'failed ATX mode % damaged parent state', m;
+        END IF;
+    END LOOP;
+END $$;
+COMMIT;
+DROP SCHEMA atx_cb_s CASCADE;
+SELECT pgv_free();
+
+-- First extension load inside nested autonomous transactions must still clean
+-- up child transactional state on both COMMIT and ABORT without parent frames.
+CREATE FUNCTION pgv_atx_lazy_d2(do_abort boolean) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN AUTONOMOUS
+    PERFORM pgv_set('lazy_d2_tx', 'v', 20, true);
+    PERFORM pgv_set('lazy_d2_reg', 'v', 2, false);
+    IF do_abort THEN
+        RAISE EXCEPTION 'planned d2 abort';
+    END IF;
+END $$;
+CREATE FUNCTION pgv_atx_lazy_d1(abort_d2 boolean, abort_d1 boolean) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN AUTONOMOUS
+    BEGIN
+        PERFORM pgv_atx_lazy_d2(abort_d2);
+    EXCEPTION WHEN raise_exception THEN
+        NULL;
+    END;
+    IF pgv_exists('lazy_d2_tx') THEN
+        RAISE EXCEPTION 'depth-2 transactional package escaped to depth-1';
+    END IF;
+    PERFORM pgv_set('lazy_d1_tx', 'v', 10, true);
+    PERFORM pgv_set('lazy_d1_reg', 'v', 1, false);
+    IF abort_d1 THEN
+        RAISE EXCEPTION 'planned d1 abort';
+    END IF;
+END $$;
+CREATE FUNCTION pgv_atx_lazy_direct_d1(tx_only boolean, do_abort boolean) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN AUTONOMOUS
+    PERFORM pgv_set('lazy_direct_tx', 'v', 11, true);
+    IF NOT tx_only THEN
+        PERFORM pgv_set('lazy_direct_reg', 'v', 111, false);
+    END IF;
+    IF do_abort THEN
+        RAISE EXCEPTION 'planned direct d1 abort';
+    END IF;
+END $$;
+\c -
+BEGIN;
+SELECT pgv_atx_lazy_direct_d1(true, false);
+SELECT pgv_exists('lazy_direct_tx') AS direct_tx_only_visible,
+       count(*) AS main_ctx_after_tx_only_lazy_commit
+FROM pg_backend_memory_contexts WHERE name = 'pg_variables: main memory context';
+COMMIT;
+\c -
+BEGIN;
+SELECT pgv_atx_lazy_direct_d1(false, false);
+SELECT pgv_exists('lazy_direct_tx') AS direct_d1_tx_visible,
+       pgv_get('lazy_direct_reg', 'v', NULL::integer, false) AS direct_d1_reg
+FROM (SELECT 1) s;
+COMMIT;
+\c -
+BEGIN;
+DO $$
+BEGIN
+    PERFORM pgv_atx_lazy_direct_d1(false, true);
+EXCEPTION WHEN raise_exception THEN
+    NULL;
+END $$;
+SELECT pgv_exists('lazy_direct_tx') AS direct_d1_tx_after_abort,
+       pgv_get('lazy_direct_reg', 'v', NULL::integer, false) AS direct_d1_reg_after_abort
+FROM (SELECT 1) s;
+COMMIT;
+\c -
+BEGIN;
+SELECT pgv_atx_lazy_d1(false, false);
+SELECT pgv_exists('lazy_d1_tx') AS d1_tx_visible,
+       pgv_exists('lazy_d2_tx') AS d2_tx_visible,
+       pgv_get('lazy_d1_reg', 'v', NULL::integer, false) AS d1_reg,
+       pgv_get('lazy_d2_reg', 'v', NULL::integer, false) AS d2_reg,
+       count(*) AS stats_pkgs FROM pgv_stats();
+COMMIT;
+\c -
+BEGIN;
+DO $$
+BEGIN
+    PERFORM pgv_atx_lazy_d1(true, true);
+EXCEPTION WHEN raise_exception THEN
+    NULL;
+END $$;
+SELECT pgv_exists('lazy_d1_tx') AS d1_tx_after_abort,
+       pgv_exists('lazy_d2_tx') AS d2_tx_after_abort,
+       pgv_get('lazy_d1_reg', 'v', NULL::integer, false) AS d1_reg_after_abort,
+       pgv_get('lazy_d2_reg', 'v', NULL::integer, false) AS d2_reg_after_abort,
+       count(*) AS stats_pkgs_after_abort FROM pgv_stats();
+COMMIT;
+DROP FUNCTION pgv_atx_lazy_direct_d1(boolean, boolean);
+DROP FUNCTION pgv_atx_lazy_d1(boolean, boolean);
+DROP FUNCTION pgv_atx_lazy_d2(boolean);
+SELECT pgv_free();

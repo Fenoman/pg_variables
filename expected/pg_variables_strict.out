@@ -5,10 +5,9 @@ SELECT pgv_free();
 (1 row)
 
 -- pgv_get(strict := false) must return NULL for a transactionally removed
--- variable, not its stale pre-removal value: getVariableInternal() returns the
--- now-invalid entry at strict=false, so variable_get() has to check validity
--- itself. Only observable while the package stays alive through another
--- variable (otherwise the package lookup already returns NULL).
+-- variable instead of its pre-removal value. getVariableInternal() treats a
+-- removed variable as absent at strict=false and returns NULL even when the
+-- requested type differs from the removed variable's former type.
 BEGIN;
 SELECT pgv_set('strictpkg', 'keep', 1);
  pgv_set 
@@ -38,6 +37,18 @@ SELECT pgv_get('strictpkg', 'v', NULL::int, false) AS get_nonstrict;
  get_nonstrict 
 ---------------
               
+(1 row)
+
+SELECT pgv_get('strictpkg', 'v', NULL::text, false) AS get_other_type;
+ get_other_type 
+----------------
+ 
+(1 row)
+
+SELECT pgv_get('strictpkg', 'v', NULL::int[], false) AS get_other_array_type;
+ get_other_array_type 
+----------------------
+ 
 (1 row)
 
 -- strict=true still raises for the removed variable.

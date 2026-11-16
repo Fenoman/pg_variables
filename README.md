@@ -243,7 +243,7 @@ Function | Returns | Description
 `pgv_remove(package text)` | `void` | Removes the package and all package variables with the corresponding name. Required package must exists, otherwise the error will be raised.
 `pgv_free()` | `void` | Removes all packages and variables.
 `pgv_list()` | `table(package text, name text, is_transactional bool)` | Returns set of records of assigned packages and variables.
-`pgv_stats()` | `table(package text, allocated_memory bigint)` | Returns list of assigned packages and used memory in bytes.
+`pgv_stats()` | `table(package text, allocated_memory bigint)` | Returns package memory-context allocation in bytes, including reserved space.
 
 Note that **pgv_stats()** works only with the PostgreSQL 9.6 and newer.
 
@@ -327,7 +327,7 @@ SELECT * FROM pgv_list() order by package, name;
  vars    | text1 | f
 ```
 
-And get used memory in bytes:
+And get memory allocated to package contexts in bytes:
 
 ```sql
 SELECT * FROM pgv_stats() order by package;
@@ -369,14 +369,54 @@ PostgreSQL materializes holdable cursors before transaction end.  Therefore, a
 the materialized in-transaction snapshot after `COMMIT`, even though subsequent
 `pgv_*` calls see the discarded or restored state.
 
-Active record and statistics cursors continue after `RELEASE SAVEPOINT`
-while their source collection state remains alive.
-For a full record scan opened inside the savepoint, RELEASE retains references
-to the unread entries. Subsequent inserts are excluded from that scan, updates
-to retained entries remain visible, and the deletion restriction above still
-applies. Unread statistics rows are captured at RELEASE. This extra storage is
-used only for scans crossing a savepoint boundary. Removing or replacing the
-source collection state still ends its record scans.
+Active record and statistics cursors continue after `RELEASE SAVEPOINT` while
+their source collection state remains alive:
+
+- Full record scans opened inside the savepoint retain references to unread
+  entries: updates to retained entries remain visible, subsequent inserts are
+  excluded, and key deletion remains blocked until the scan closes.
+- Statistics scans capture unread rows at `RELEASE SAVEPOINT`.
+- Removing or replacing the source collection state ends its record scans.
+- At most 64 active hash-table scans (`pgv_select()` full collection scans and
+  `pgv_stats()`) may stay registered concurrently in a backend so server
+  hash-scan slots remain available for portal and subtransaction cleanup.
+  Cursors already materialized on `RELEASE SAVEPOINT` or `WITH HOLD` commit do
+  not hold an active hash scan.
+
+Altering or dropping a named composite type (`ALTER TYPE`, `DROP TYPE`) while
+values of that type are stored in scalar, array or nested record variables is
+not supported: remove or recreate affected variables before changing composite
+type definitions. PostgreSQL 16.16+, 17.12+ and 18.7+ reject deformation of
+outdated composite datums at runtime, whereas earlier minor kernels do not
+version composite datums in memory.
+
+`PREPARE TRANSACTION` is rejected while package or variable changes remain in
+the transaction's bookkeeping. This includes creating or removing regular
+variables, not just transactional variables. Updating an existing regular scalar
+without creating bookkeeping does not itself prevent PREPARE. This is a
+backend-local restriction, not support for transferring variables through 2PC.
+
+In Enterprise, transactional state is isolated across autonomous transactions.
+Entering an autonomous transaction ends open transactional record scans in the
+parent. Parent regular record and statistics scans continue while their sources
+remain alive. Regular changes survive autonomous COMMIT and ABORT. Transactional
+values created inside an autonomous transaction do not escape to its parent.
+
+Record hash and comparison functions may read variables and modify independent
+variables, including inside autonomous transactions. They cannot mutate a
+collection active in their call chain, remove its package, or call `pgv_free()`.
+Such calls raise `object_in_use` before invalidating the active operation.
+
+`pgv_stats().allocated_memory` sums the regular and current transactional package
+contexts and their descendants:
+
+- Included: allocator reserves, retained savepoint states, and removed packages
+  until deferred cleanup completes.
+- Excluded: the module context, changes bookkeeping, SRF result storage, server
+  type caches, and suspended parent ATX contexts.
+
+It measures neither live payload bytes nor total backend memory. Compare
+`pg_backend_memory_contexts` and backend RSS separately when checking growth.
 
 Following use cases describe behavior of transactional variables:
 

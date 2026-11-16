@@ -142,3 +142,68 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Mixing named table rowtypes (including declared array dimensions) and
+-- anonymous ROW() values normalizes composite headers and ignores attndims.
+CREATE TEMP TABLE rec_named_arr(k integer, tags text[]);
+INSERT INTO rec_named_arr VALUES (1, ARRAY['table']);
+BEGIN;
+SELECT pgv_insert('named_mix', 'r', t, true) FROM rec_named_arr AS t;
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT k, tags FROM pgv_select('named_mix', 'r') AS x(k integer, tags text[]) ORDER BY k;
+ k |  tags   
+---+---------
+ 1 | {table}
+(1 row)
+
+SAVEPOINT sp_named_cow;
+SELECT pgv_insert('named_mix', 'r', ROW(2, ARRAY['anon']::text[]), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT k, tags FROM pgv_select('named_mix', 'r') AS x(k integer, tags text[]) ORDER BY k;
+ k |  tags   
+---+---------
+ 1 | {table}
+ 2 | {anon}
+(2 rows)
+
+SELECT pgv_update('named_mix', 'r', t) FROM (SELECT (1, ARRAY['table_upd']::text[])::rec_named_arr AS t) s;
+ pgv_update 
+------------
+ t
+(1 row)
+
+SELECT pgv_update('named_mix', 'r', ROW(1, ARRAY['updated']::text[]));
+ pgv_update 
+------------
+ t
+(1 row)
+
+SELECT k, tags FROM pgv_select('named_mix', 'r') AS x(k integer, tags text[]) ORDER BY k;
+ k |   tags    
+---+-----------
+ 1 | {updated}
+ 2 | {anon}
+(2 rows)
+
+ROLLBACK TO sp_named_cow;
+SELECT k, tags FROM pgv_select('named_mix', 'r') AS x(k integer, tags text[]) ORDER BY k;
+ k |  tags   
+---+---------
+ 1 | {table}
+(1 row)
+
+COMMIT;
+DROP TABLE rec_named_arr;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

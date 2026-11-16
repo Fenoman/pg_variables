@@ -1,3 +1,2 @@
--- Pure round-trip baseline: subtract from the pgv_* scripts to isolate the
--- extension cost per transaction.
+-- One-statement autocommit baseline for set_reg.sql and set_tx.sql.
 SELECT 1;

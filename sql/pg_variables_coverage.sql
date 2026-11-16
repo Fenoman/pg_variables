@@ -41,3 +41,14 @@ SELECT pgv_exists('cov3', 'tx') AS tx_after_proc;
 SELECT pgv_get('cov3', 'reg', NULL::int) AS reg_after_proc;
 DROP PROCEDURE pgv_cov_proc();
 SELECT pgv_free();
+
+-- WITH HOLD materializes transactional rows before their state is discarded.
+BEGIN;
+SELECT pgv_insert('hold_transactional', 'r', ROW(1, 'snapshot'::text), true);
+DECLARE transactional_hold CURSOR WITH HOLD FOR
+    SELECT pgv_select('hold_transactional', 'r');
+COMMIT;
+SELECT pgv_exists('hold_transactional') AS package_after_hold_commit;
+FETCH ALL FROM transactional_hold;
+CLOSE transactional_hold;
+SELECT pgv_free();

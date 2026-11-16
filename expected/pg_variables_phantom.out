@@ -180,3 +180,287 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Package-removal tombstones survive several nested rollbacks.
+BEGIN;
+SELECT pgv_set('nested_recreate', 'old_tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('nested_recreate', 'old_tx2', 22, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('nested_recreate');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT outer_recreate;
+SAVEPOINT middle_recreate;
+SAVEPOINT inner_recreate;
+SELECT pgv_set('nested_recreate', 'new_regular', 2, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO outer_recreate;
+DO $$ BEGIN
+ IF pgv_exists('nested_recreate', 'old_tx') OR
+    pgv_exists('nested_recreate', 'old_tx2') OR
+    pgv_get('nested_recreate', 'old_tx', NULL::integer, false) IS NOT NULL OR
+    pgv_get('nested_recreate', 'old_tx2', NULL::integer, false) IS NOT NULL OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'nested_recreate') <> 1 THEN
+  RAISE EXCEPTION 'nested rollback resurrected a removed transactional value';
+ END IF;
+END $$;
+COMMIT;
+DO $$ BEGIN
+ IF pgv_exists('nested_recreate', 'old_tx') OR
+    pgv_exists('nested_recreate', 'old_tx2') OR
+    pgv_get('nested_recreate', 'new_regular', NULL::integer) IS DISTINCT FROM 2 THEN
+  RAISE EXCEPTION 'commit retained a removed value or lost regular data';
+ END IF;
+END $$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Revalidated values start independent savepoint histories.
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('reuse_removed', 'tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('reuse_removed');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_set('reuse_removed', 'reg', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('reuse_removed', 'tx', 22, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT later;
+SELECT pgv_set('reuse_removed', 'tx', 33, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO later;
+DO $$ BEGIN
+ IF pgv_get('reuse_removed', 'tx', NULL::integer, false) IS DISTINCT FROM 22 THEN
+  RAISE EXCEPTION 'later rollback lost a revalidated value';
+ END IF;
+END $$;
+ROLLBACK;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('reuse_release', 'tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT removal;
+SELECT pgv_remove('reuse_release');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT recreate;
+SELECT pgv_set('reuse_release', 'reg', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('reuse_release', 'tx', 22, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+RELEASE removal;
+SAVEPOINT later_outer;
+SAVEPOINT later_inner;
+SELECT pgv_set('reuse_release', 'tx', 33, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO later_inner;
+DO $$ BEGIN
+ IF pgv_get('reuse_release', 'tx', NULL::integer, false) IS DISTINCT FROM 22 THEN
+  RAISE EXCEPTION 'released removal contaminated a later rollback';
+ END IF;
+END $$;
+ROLLBACK;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Revalidation deeper than an unreleased removal preserves its own savepoint
+-- history while still hiding the pre-removal value if the recreation rolls back.
+BEGIN;
+SELECT pgv_set('reuse_deep', 'tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT removal;
+SELECT pgv_remove('reuse_deep');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT recreate;
+SELECT pgv_set('reuse_deep', 'reg', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('reuse_deep', 'tx', 22, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT later;
+SELECT pgv_set('reuse_deep', 'tx', 33, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO later;
+DO $$ BEGIN
+ IF pgv_get('reuse_deep', 'tx', NULL::integer, false) IS DISTINCT FROM 22 OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'reuse_deep') IS DISTINCT FROM 2 THEN
+  RAISE EXCEPTION 'rollback to post-revalidation savepoint lost the revalidated value';
+ END IF;
+END $$;
+ROLLBACK TO recreate;
+DO $$ BEGIN
+ IF pgv_exists('reuse_deep', 'tx') OR
+    pgv_get('reuse_deep', 'tx', NULL::integer, false) IS NOT NULL OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'reuse_deep') IS DISTINCT FROM 1 THEN
+  RAISE EXCEPTION 'rolling back revalidation revived the pre-removal value';
+ END IF;
+END $$;
+ROLLBACK TO removal;
+DO $$ BEGIN
+ IF pgv_get('reuse_deep', 'tx', NULL::integer, false) IS DISTINCT FROM 11 OR
+    pgv_get('reuse_deep', 'reg', NULL::integer, false) IS DISTINCT FROM 1 OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'reuse_deep') IS DISTINCT FROM 2 THEN
+  RAISE EXCEPTION 'rolling back package removal did not restore the pre-removal value';
+ END IF;
+END $$;
+COMMIT;
+DO $$ BEGIN
+ IF pgv_exists('reuse_deep', 'tx') OR
+    pgv_get('reuse_deep', 'reg', NULL::integer, false) IS DISTINCT FROM 1 THEN
+  RAISE EXCEPTION 'commit after rollback retained transactional state or lost regular data';
+ END IF;
+END $$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Releasing a deeper revalidating savepoint into a tombstone savepoint keeps
+-- both later savepoint rollback and the outer removal boundary intact.
+BEGIN;
+SELECT pgv_set('reuse_squash', 'tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT removal;
+SELECT pgv_remove('reuse_squash');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT recreate;
+SELECT pgv_set('reuse_squash', 'reg', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT revalidate_sp;
+SELECT pgv_set('reuse_squash', 'tx', 22, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+RELEASE SAVEPOINT revalidate_sp;
+SAVEPOINT later;
+SELECT pgv_set('reuse_squash', 'tx', 33, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO later;
+DO $$ BEGIN
+ IF pgv_get('reuse_squash', 'tx', NULL::integer, false) IS DISTINCT FROM 22 THEN
+  RAISE EXCEPTION 'rollback after released revalidation lost the revalidated value';
+ END IF;
+END $$;
+ROLLBACK TO recreate;
+DO $$ BEGIN
+ IF pgv_exists('reuse_squash', 'tx') OR
+    pgv_get('reuse_squash', 'tx', NULL::integer, false) IS NOT NULL THEN
+  RAISE EXCEPTION 'rolling back squashed revalidation revived the pre-removal value';
+ END IF;
+END $$;
+ROLLBACK;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

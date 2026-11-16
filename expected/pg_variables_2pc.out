@@ -4,13 +4,8 @@ SELECT pgv_free();
  
 (1 row)
 
--- Transactional variables live in backend-local memory and cannot travel with
--- a prepared transaction to the session that finally commits it. Preparing a
--- transaction that modified them used to leak the values into the current
--- session (visible to the next pooled client) and leave a stale changesStack
--- that the next statement's commit corrupted. The prepare must now be refused.
--- The check runs in the XACT_EVENT_PRE_PREPARE callback, which fires before the
--- max_prepared_transactions guard, so the outcome does not depend on that GUC.
+-- Pending backend-local histories cannot be transferred by two-phase commit.
+-- The extension check precedes the max_prepared_transactions server guard.
 BEGIN;
 SELECT pgv_set('tx2pc', 'v', 'x'::text, true);
  pgv_set 
@@ -19,8 +14,8 @@ SELECT pgv_set('tx2pc', 'v', 'x'::text, true);
 (1 row)
 
 PREPARE TRANSACTION 'pgv_2pc';
-ERROR:  cannot PREPARE a transaction that has modified transactional variables
-DETAIL:  pg_variables keeps transactional variables in backend-local memory, which two-phase commit cannot transfer to the committing session.
+ERROR:  cannot PREPARE a transaction with pending pg_variables state changes
+DETAIL:  Backend-local package and variable state is not transferred by two-phase commit.
 -- The failed prepare aborts the transaction, so nothing leaks into the session.
 SELECT pgv_exists('tx2pc') AS leaked;
  leaked 
@@ -48,6 +43,29 @@ SELECT pgv_exists('ok2pc') AS exists_after_commit;
  exists_after_commit 
 ---------------------
  f
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Creating regular variables also registers package bookkeeping.
+BEGIN;
+SELECT pgv_set('regular2pc', 'v', 7, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+PREPARE TRANSACTION 'pgv_regular_2pc';
+ERROR:  cannot PREPARE a transaction with pending pg_variables state changes
+DETAIL:  Backend-local package and variable state is not transferred by two-phase commit.
+SELECT pgv_get('regular2pc', 'v', NULL::integer) AS regular_survives_abort;
+ regular_survives_abort 
+------------------------
+                      7
 (1 row)
 
 SELECT pgv_free();

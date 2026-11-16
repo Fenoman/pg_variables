@@ -35,6 +35,81 @@
 
 #include "pg_variables.h"
 
+typedef struct RecordCallback
+{
+	Variable   *variable;
+	struct RecordCallback *previous;
+} RecordCallback;
+
+static RecordCallback *record_callbacks;
+
+/* Support functions may read state, but cannot mutate an active collection. */
+void
+check_record_callback_mutation(Package *package, Variable *variable)
+{
+	RecordCallback *callback;
+
+	for (callback = record_callbacks; callback; callback = callback->previous)
+	{
+		if ((!package && !variable) || callback->variable == variable ||
+			callback->variable->package == package)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("cannot modify an active record collection from its hash or comparison function")));
+	}
+}
+
+void
+check_record_callback_name(Package *package, const char *var_name)
+{
+	RecordCallback *callback;
+
+	for (callback = record_callbacks; callback; callback = callback->previous)
+	{
+		if (callback->variable->package == package &&
+			strcmp(callback->variable->transObject.name, var_name) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("cannot modify an active record collection from its hash or comparison function")));
+	}
+}
+
+void
+check_record_callback_text(text *package_name, text *var_name)
+{
+	RecordCallback *callback;
+	Size		pkg_len;
+	Size		var_len = 0;
+
+	if (likely(record_callbacks == NULL))
+		return;
+
+	pkg_len = VARSIZE_ANY_EXHDR(package_name);
+	if (pkg_len >= NAMEDATALEN - 1)
+		return;
+	if (var_name != NULL)
+	{
+		var_len = VARSIZE_ANY_EXHDR(var_name);
+		if (var_len >= NAMEDATALEN - 1)
+			return;
+	}
+
+	for (callback = record_callbacks; callback; callback = callback->previous)
+	{
+		const char *active_pkg = callback->variable->package->transObject.name;
+		const char *active_var = callback->variable->transObject.name;
+
+		if (active_pkg[pkg_len] == '\0' &&
+			memcmp(VARDATA_ANY(package_name), active_pkg, pkg_len) == 0 &&
+			(var_name == NULL ||
+			 (active_var[var_len] == '\0' &&
+			  memcmp(VARDATA_ANY(var_name), active_var, var_len) == 0)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("cannot modify an active record collection from its hash or comparison function")));
+	}
+}
+
 /*
  * Hash function for records.
  *
@@ -46,11 +121,23 @@ record_hash(const void *key, Size keysize)
 {
 	HashRecordKey k = *((const HashRecordKey *) key);
 	Datum		h;
+	RecordCallback callback;
 
 	if (k.is_null)
 		return 0;
 
-	h = FunctionCall1Coll(k.hash_proc, DEFAULT_COLLATION_OID, k.value);
+	callback.variable = k.record->variable;
+	callback.previous = record_callbacks;
+	record_callbacks = &callback;
+	PG_TRY();
+	{
+		h = FunctionCall1Coll(&k.record->hash_proc, DEFAULT_COLLATION_OID, k.value);
+	}
+	PG_FINALLY();
+	{
+		record_callbacks = callback.previous;
+	}
+	PG_END_TRY();
 	return DatumGetUInt32(h);
 }
 
@@ -63,6 +150,7 @@ record_match(const void *key1, const void *key2, Size keysize)
 	HashRecordKey k1 = *((const HashRecordKey *) key1);
 	HashRecordKey k2 = *((const HashRecordKey *) key2);
 	Datum		c;
+	RecordCallback callback;
 
 	if (k1.is_null)
 	{
@@ -74,8 +162,19 @@ record_match(const void *key1, const void *key2, Size keysize)
 	else if (k2.is_null)
 		return -1;				/* not-NULL "<" NULL */
 
-	c = FunctionCall2Coll(k1.cmp_proc, DEFAULT_COLLATION_OID,
-						  k1.value, k2.value);
+	callback.variable = k1.record->variable;
+	callback.previous = record_callbacks;
+	record_callbacks = &callback;
+	PG_TRY();
+	{
+		c = FunctionCall2Coll(&k1.record->cmp_proc, DEFAULT_COLLATION_OID,
+							  k1.value, k2.value);
+	}
+	PG_FINALLY();
+	{
+		record_callbacks = callback.previous;
+	}
+	PG_END_TRY();
 	return DatumGetInt32(c);
 }
 
@@ -90,6 +189,7 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 	Oid			keyid;
 
 	Assert(variable->typid == RECORDOID);
+	record->variable = variable;
 
 	if (tupdesc->natts == 0)
 		ereport(ERROR,
@@ -211,6 +311,11 @@ coerce_unknown_rewrite_tupdesc(TupleDesc old_tupdesc, TupleDesc *return_tupdesc)
 		TupleDescAttr(*return_tupdesc, i)->attcacheoff = -1;
 #endif
 	}
+
+	/* Converted fields need their own anonymous rowtype identity. */
+	(*return_tupdesc)->tdtypeid = RECORDOID;
+	(*return_tupdesc)->tdtypmod = -1;
+	BlessTupleDesc(*return_tupdesc);
 }
 
 /*
@@ -319,7 +424,6 @@ check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc tupdesc)
 		}
 
 		if ((attr1->atttypid != attr2->atttypid)
-			|| (attr1->attndims != attr2->attndims)
 			|| (attr1->atttypmod != attr2->atttypmod))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -356,35 +460,18 @@ check_record_key(Variable *variable, Oid typid)
 static Datum
 copy_record_tuple(RecordVar *record, HeapTupleHeader tupleHeader)
 {
-	TupleDesc	tupdesc;
-	HeapTupleHeader result;
-	int			tuple_len;
-
-	tupdesc = record->tupdesc;
+	HeapTupleData tuple;
 
 	/*
-	 * If the tuple contains any external TOAST pointers, we have to inline
-	 * those fields to meet the conventions for composite-type Datums.
+	 * The server copies external fields and normalizes all composite header
+	 * fields, including the attribute version when changing to anonymous RECORD.
 	 */
-	if (HeapTupleHeaderHasExternal(tupleHeader))
-		return toast_flatten_tuple_to_datum(tupleHeader,
-											HeapTupleHeaderGetDatumLength(tupleHeader),
-											tupdesc);
+	tuple.t_len = HeapTupleHeaderGetDatumLength(tupleHeader);
+	ItemPointerSetInvalid(&tuple.t_self);
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = tupleHeader;
 
-	/*
-	 * Fast path for easy case: just make a palloc'd copy and insert the
-	 * correct composite-Datum header fields (since those may not be set if
-	 * the given tuple came from disk, rather than from heap_form_tuple).
-	 */
-	tuple_len = HeapTupleHeaderGetDatumLength(tupleHeader);
-	result = (HeapTupleHeader) palloc(tuple_len);
-	memcpy((char *) result, (char *) tupleHeader, tuple_len);
-
-	HeapTupleHeaderSetDatumLength(result, tuple_len);
-	HeapTupleHeaderSetTypeId(result, tupdesc->tdtypeid);
-	HeapTupleHeaderSetTypMod(result, tupdesc->tdtypmod);
-
-	return PointerGetDatum(result);
+	return heap_copy_tuple_as_datum(&tuple, record->tupdesc);
 }
 
 static Datum
@@ -446,8 +533,7 @@ insert_record(Variable *variable, HeapTupleHeader tupleHeader)
 	/* First, check if there is a record with same key */
 	k.value = value;
 	k.is_null = isnull;
-	k.hash_proc = &record->hash_proc;
-	k.cmp_proc = &record->cmp_proc;
+	k.record = record;
 
 	PG_TRY();
 	{
@@ -503,8 +589,7 @@ update_record(Variable *variable, HeapTupleHeader tupleHeader)
 	value = get_record_key(tuple, record->tupdesc, &isnull);
 	k.value = value;
 	k.is_null = isnull;
-	k.hash_proc = &record->hash_proc;
-	k.cmp_proc = &record->cmp_proc;
+	k.record = record;
 
 	PG_TRY();
 	{
@@ -556,8 +641,7 @@ delete_record(Variable *variable, Datum value, bool is_null)
 	/* Delete a record */
 	k.value = value;
 	k.is_null = is_null;
-	k.hash_proc = &record->hash_proc;
-	k.cmp_proc = &record->cmp_proc;
+	k.record = record;
 
 	hashvalue = get_hash_value(record->rhash, &k);
 	item = (HashRecordEntry *) hash_search_with_hash_value(record->rhash, &k,
@@ -601,8 +685,7 @@ insert_record_copy(RecordVar *dest_record, Datum src_tuple, Variable *variable)
 
 	k.value = value;
 	k.is_null = isnull;
-	k.hash_proc = &dest_record->hash_proc;
-	k.cmp_proc = &dest_record->cmp_proc;
+	k.record = dest_record;
 
 	PG_TRY();
 	{

@@ -46,12 +46,38 @@ SELECT pgv_free();
 -- Failed hash and comparison calls release unpublished tuples.
 -- SQLSTATE and sequence counters verify the actual support function path.
 CREATE TYPE pgv_error_key AS ENUM ('a', 'b');
+-- Support functions can inspect state and mutate independent variables.
+CREATE FUNCTION pgv_reenter(source text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('pgv_test.reentry_source', true) IS DISTINCT FROM source THEN
+        RETURN;
+    END IF;
+    CASE current_setting('pgv_test.reentry_action', true)
+      WHEN 'variable' THEN PERFORM pgv_remove('callback_owner', 'r');
+      WHEN 'package' THEN PERFORM pgv_remove('callback_owner');
+      WHEN 'free' THEN PERFORM pgv_free();
+      WHEN 'insert' THEN PERFORM pgv_insert('callback_owner', 'r',
+                                           ROW('b'::pgv_error_key, 'nested'::text));
+      WHEN 'update' THEN PERFORM pgv_update('callback_owner', 'r',
+                                           ROW('a'::pgv_error_key, 'nested'::text));
+      WHEN 'delete' THEN PERFORM pgv_delete('callback_owner', 'r', 'a'::pgv_error_key);
+      WHEN 'independent' THEN
+        PERFORM pgv_set('callback_other', 'v', 1, false);
+        IF NOT pgv_exists('callback_owner', 'r') THEN
+            RAISE EXCEPTION 'callback cannot inspect the parent collection';
+        END IF;
+      WHEN 'same_pkg_reg' THEN
+        PERFORM pgv_set('recreate_cb', 'reg', 1, false);
+      ELSE NULL;
+    END CASE;
+END $$;
 CREATE SEQUENCE pgv_hash_calls;
 CREATE SEQUENCE pgv_cmp_calls;
 CREATE FUNCTION pgv_error_hash(pgv_error_key) RETURNS integer
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 BEGIN
     PERFORM nextval('pgv_hash_calls');
+    PERFORM pgv_reenter('hash');
     IF current_setting('pgv_test.error', true) = 'hash' THEN
         RAISE EXCEPTION USING ERRCODE = 'PZ061', MESSAGE = 'controlled hash failure';
     END IF;
@@ -62,6 +88,7 @@ CREATE FUNCTION pgv_error_cmp(pgv_error_key, pgv_error_key) RETURNS integer
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 BEGIN
     PERFORM nextval('pgv_cmp_calls');
+    PERFORM pgv_reenter('compare');
     IF current_setting('pgv_test.error', true) = 'compare' THEN
         RAISE EXCEPTION USING ERRCODE = 'PZ062', MESSAGE = 'controlled comparison failure';
     END IF;
@@ -194,9 +221,8 @@ BEGIN
                 FROM pg_catalog.pg_backend_memory_contexts
                 WHERE name = 'pg_variables: records'
             $query$ INTO after_used;
-            -- Comparison starts after one row is copied. Partial state remains
-            -- in the transactional context, but the failing tuple is released.
-            allowed_growth := CASE action WHEN 'hash' THEN 32768 ELSE 98304 END;
+            -- The entire unpublished collection is released on either error.
+            allowed_growth := 32768;
             IF after_used - before_used > allowed_growth THEN
                 RAISE EXCEPTION 'failed copy retained its unpublished tuple';
             END IF;
@@ -205,6 +231,181 @@ BEGIN
     END LOOP;
 END
 $$;
+-- Repeated partial copies must release the entire unpublished state.
+DO $$
+DECLARE
+    before_used bigint;
+    after_used bigint;
+    before_contexts bigint;
+    after_contexts bigint;
+    i integer;
+BEGIN
+    PERFORM pgv_set('copy_leak', 'keep', 1, false);
+    PERFORM set_config('pgv_test.error', 'none', true);
+    PERFORM pgv_insert('copy_leak', 'r',
+                       ROW('a'::pgv_error_key, repeat('x', 65536)), true);
+    PERFORM pgv_insert('copy_leak', 'r',
+                       ROW('b'::pgv_error_key, repeat('x', 65536)), true);
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NOT NULL THEN
+        EXECUTE $q$ SELECT coalesce(sum(used_bytes), 0), count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: records' $q$
+            INTO before_used, before_contexts;
+    END IF;
+    PERFORM set_config('pgv_test.error', 'compare', true);
+    FOR i IN 1..100 LOOP
+        BEGIN
+            PERFORM pgv_update('copy_leak', 'r',
+                               ROW('a'::pgv_error_key, repeat('y', 65536)));
+            RAISE EXCEPTION 'comparison failure did not execute';
+        EXCEPTION WHEN SQLSTATE 'PZ062' THEN NULL;
+        END;
+    END LOOP;
+    PERFORM set_config('pgv_test.error', 'none', true);
+    IF before_used IS NOT NULL THEN
+        EXECUTE $q$ SELECT coalesce(sum(used_bytes), 0), count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: records' $q$
+            INTO after_used, after_contexts;
+        IF after_contexts <> before_contexts OR after_used - before_used > 32768 THEN
+            RAISE EXCEPTION 'partial copies retained % contexts and % bytes',
+                            after_contexts - before_contexts, after_used - before_used;
+        END IF;
+    END IF;
+    IF (SELECT count(*) FROM pgv_select('copy_leak', 'r')
+        AS t(k pgv_error_key, v text) WHERE v = repeat('x', 65536)) <> 2 THEN
+        RAISE EXCEPTION 'failed copies changed parent rows';
+    END IF;
+END
+$$;
+SELECT pgv_remove('copy_leak');
+-- Destructive reentry is rejected before it frees or changes an active hash.
+DO $$
+DECLARE
+    source text;
+    action text;
+    operation text;
+    rejected boolean;
+BEGIN
+    PERFORM pgv_insert('callback_owner', 'r', ROW('a'::pgv_error_key, 'parent'::text));
+    FOREACH source IN ARRAY ARRAY['hash', 'compare'] LOOP
+        PERFORM set_config('pgv_test.reentry_source', source, true);
+        FOREACH action IN ARRAY ARRAY['variable', 'package', 'free', 'insert', 'update', 'delete'] LOOP
+            PERFORM set_config('pgv_test.reentry_action', action, true);
+            FOREACH operation IN ARRAY ARRAY['insert', 'update', 'delete', 'key', 'keys'] LOOP
+                rejected := false;
+                BEGIN
+                    CASE operation
+                      WHEN 'insert' THEN PERFORM pgv_insert('callback_owner', 'r',
+                                                           ROW('b'::pgv_error_key, 'outer'::text));
+                      WHEN 'update' THEN PERFORM pgv_update('callback_owner', 'r',
+                                                           ROW('a'::pgv_error_key, 'outer'::text));
+                      WHEN 'delete' THEN PERFORM pgv_delete('callback_owner', 'r', 'a'::pgv_error_key);
+                      WHEN 'key' THEN PERFORM pgv_select('callback_owner', 'r', 'a'::pgv_error_key);
+                      WHEN 'keys' THEN PERFORM pgv_select('callback_owner', 'r', ARRAY['a'::pgv_error_key]);
+                    END CASE;
+                EXCEPTION WHEN object_in_use THEN rejected := true;
+                END;
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'unsafe % reentry from % during % was accepted', action, source, operation;
+                END IF;
+            END LOOP;
+        END LOOP;
+        PERFORM set_config('pgv_test.reentry_action', 'independent', true);
+        IF pgv_select('callback_owner', 'r', 'a'::pgv_error_key)::text
+           IS DISTINCT FROM '(a,parent)' OR
+           pgv_get('callback_other', 'v', NULL::integer) IS DISTINCT FROM 1 THEN
+            RAISE EXCEPTION 'callback damaged the original row or blocked independent work';
+        END IF;
+    END LOOP;
+    PERFORM set_config('pgv_test.reentry_source', 'none', true);
+    PERFORM pgv_free();
+END $$;
+-- Package recreation records zero-copy tombstones without invoking hash
+-- callbacks on removed collections, and aborted recreation with surviving
+-- regular side effects in the same package keeps removed collections hidden
+-- until the package removal itself rolls back.
+BEGIN;
+SELECT pgv_insert('recreate_cb', 'r', ROW('a'::pgv_error_key, 'old'::text), true);
+SAVEPOINT removal;
+SELECT pgv_remove('recreate_cb');
+SAVEPOINT recreate_ok;
+SET LOCAL pgv_test.reentry_source = 'hash';
+SET LOCAL pgv_test.reentry_action = 'same_pkg_reg';
+SET LOCAL pgv_test.error = 'hash';
+SELECT pgv_set('recreate_cb', 'requested', 2, false);
+DO $$
+DECLARE
+    rejected boolean := false;
+BEGIN
+    IF pgv_get('recreate_cb', 'requested', NULL::integer, false) IS DISTINCT FROM 2 OR
+       pgv_exists('recreate_cb', 'reg') OR
+       pgv_exists('recreate_cb', 'r') OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'recreate_cb') <> 1 THEN
+        RAISE EXCEPTION 'recreation ran removed-record callback or exposed removed data';
+    END IF;
+    BEGIN
+        PERFORM pgv_select('recreate_cb', 'r');
+    EXCEPTION WHEN invalid_parameter_value THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'pgv_select accepted a removed collection after recreation';
+    END IF;
+END $$;
+ROLLBACK;
+SELECT pgv_free();
+-- Even when no tombstone was created on the transactional collection before an
+-- aborted subtransaction left regular side effects in the same package, the
+-- exposed removal state keeps removed transactional data hidden until rolled back.
+BEGIN;
+SELECT pgv_insert('recreate_abort', 'r', ROW('a'::pgv_error_key, 'old'::text), true);
+SAVEPOINT removal;
+SELECT pgv_remove('recreate_abort');
+SAVEPOINT recreate_fail;
+DO $$
+BEGIN
+    PERFORM pgv_set('recreate_abort', 'reg', 1, false);
+    RAISE EXCEPTION USING ERRCODE = 'PZ061', MESSAGE = 'aborted recreation';
+EXCEPTION WHEN SQLSTATE 'PZ061' THEN
+    NULL;
+END $$;
+ROLLBACK TO recreate_fail;
+DO $$
+DECLARE
+    rejected boolean := false;
+BEGIN
+    IF pgv_get('recreate_abort', 'reg', NULL::integer, false) IS DISTINCT FROM 1 OR
+       pgv_exists('recreate_abort', 'r') OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'recreate_abort') <> 1 THEN
+        RAISE EXCEPTION 'aborted recreation revived removed data or lost surviving regular values';
+    END IF;
+    BEGIN
+        PERFORM pgv_select('recreate_abort', 'r');
+    EXCEPTION WHEN invalid_parameter_value THEN
+        rejected := true;
+    END;
+    IF NOT rejected THEN
+        RAISE EXCEPTION 'pgv_select accepted a removed collection after aborted recreation';
+    END IF;
+END $$;
+ROLLBACK TO removal;
+DO $$ BEGIN
+    IF NOT pgv_exists('recreate_abort', 'r') OR
+       pgv_select('recreate_abort', 'r', 'a'::pgv_error_key)::text IS DISTINCT FROM '(a,old)' OR
+       pgv_get('recreate_abort', 'reg', NULL::integer, false) IS DISTINCT FROM 1 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'recreate_abort') <> 2 THEN
+        RAISE EXCEPTION 'rolling back package removal did not restore the transactional collection';
+    END IF;
+END $$;
+COMMIT;
+DO $$ BEGIN
+    IF pgv_exists('recreate_abort', 'r') OR
+       pgv_get('recreate_abort', 'reg', NULL::integer, false) IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'commit after rollback retained transactional collection or lost regular values';
+    END IF;
+END $$;
+SELECT pgv_free();
 DROP OPERATOR CLASS pgv_error_hash_ops USING hash;
 DROP OPERATOR CLASS pgv_error_cmp_ops USING btree;
 DROP OPERATOR FAMILY pgv_error_hash_ops USING hash;
@@ -212,4 +413,5 @@ DROP OPERATOR FAMILY pgv_error_cmp_ops USING btree;
 DROP FUNCTION pgv_error_hash(pgv_error_key);
 DROP FUNCTION pgv_error_cmp(pgv_error_key, pgv_error_key);
 DROP SEQUENCE pgv_hash_calls, pgv_cmp_calls;
+DROP FUNCTION pgv_reenter(text);
 DROP TYPE pgv_error_key;

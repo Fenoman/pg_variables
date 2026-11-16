@@ -285,3 +285,142 @@ $$;
 DROP TABLE promoted_seen;
 DROP FUNCTION pg_temp.pgv_fetch_text(refcursor, integer);
 SELECT pgv_free();
+
+-- Physical removal of a colliding child package preserves parent stats scans.
+CREATE TEMP TABLE stats_collision_names AS
+SELECT row_number() OVER () AS idx, name
+FROM (
+    SELECT 'scan_pkg_' || g AS name
+    FROM generate_series(1, 20000) g
+    WHERE (hashtext('scan_pkg_' || g) & 1023) = 0
+    ORDER BY g
+    LIMIT 5
+) s;
+DO $$
+BEGIN
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 1), 'v', 1, false);
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 2), 'v', 2, false);
+END
+$$;
+BEGIN;
+DECLARE stats_rollback_cur CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM stats_rollback_cur;
+SAVEPOINT child_collision;
+DO $$
+BEGIN
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 3), 'v', 3, true);
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 4), 'v', 4, true);
+END
+$$;
+MOVE 1 FROM stats_rollback_cur;
+ROLLBACK TO child_collision;
+DO $$
+DECLARE
+    pkg text;
+    c refcursor := 'stats_rollback_cur';
+BEGIN
+    FETCH c INTO pkg;
+    IF FOUND THEN
+        RAISE EXCEPTION 'rolled back child package remained in parent stats scan: %', pkg;
+    END IF;
+END
+$$;
+CLOSE stats_rollback_cur;
+DECLARE stats_release_cur CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM stats_release_cur;
+SAVEPOINT child_release;
+DO $$
+BEGIN
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 3), 'v', 3, false);
+    PERFORM pgv_set((SELECT name FROM stats_collision_names WHERE idx = 5), 'v', 5, false);
+END
+$$;
+MOVE 1 FROM stats_release_cur;
+DO $$
+BEGIN
+    PERFORM pgv_remove((SELECT name FROM stats_collision_names WHERE idx = 3), 'v');
+END
+$$;
+RELEASE child_release;
+DO $$
+DECLARE
+    pkg text;
+    seen text[] := ARRAY[]::text[];
+    expected text := (SELECT name FROM stats_collision_names WHERE idx = 5);
+    c refcursor := 'stats_release_cur';
+BEGIN
+    LOOP
+        FETCH c INTO pkg;
+        EXIT WHEN NOT FOUND;
+        seen := array_append(seen, pkg);
+    END LOOP;
+    IF seen IS DISTINCT FROM ARRAY[expected] THEN
+        RAISE EXCEPTION 'released empty package corrupted parent stats scan: %', seen;
+    END IF;
+END
+$$;
+CLOSE stats_release_cur;
+COMMIT;
+SELECT pgv_free();
+BEGIN;
+DECLARE stats_empty_cur CURSOR FOR SELECT (pgv_stats()).package;
+SAVEPOINT empty_sp;
+SELECT pgv_set('only_tx_1', 'v', 1, true);
+SELECT pgv_set('only_tx_2', 'v', 2, true);
+MOVE 1 FROM stats_empty_cur;
+ROLLBACK TO empty_sp;
+DO $$
+DECLARE
+    pkg text;
+    c refcursor := 'stats_empty_cur';
+BEGIN
+    FETCH c INTO pkg;
+    IF FOUND THEN
+        RAISE EXCEPTION 'empty-hash rollback left unread stats row: %', pkg;
+    END IF;
+END
+$$;
+CLOSE stats_empty_cur;
+SELECT pgv_set('commit_tx_1', 'v', 1, true);
+SELECT pgv_set('commit_tx_2', 'v', 2, true);
+DECLARE stats_commit_cur CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM stats_commit_cur;
+COMMIT;
+DROP TABLE stats_collision_names;
+SELECT pgv_free();
+
+-- Cap concurrent open hash scans so subtransaction portal cleanup cannot PANIC.
+SELECT pgv_insert('scan_cap', 'r', ROW(1, 'a'::text), false);
+SELECT pgv_insert('scan_cap', 'r', ROW(2, 'b'::text), false);
+BEGIN;
+DO $$
+DECLARE
+    i integer;
+    cname text;
+BEGIN
+    FOR i IN 1..64 LOOP
+        cname := 'cap_cur_' || i;
+        IF (i % 2) = 0 THEN
+            EXECUTE format('DECLARE %I CURSOR FOR SELECT pgv_select(%L, %L)',
+                           cname, 'scan_cap', 'r');
+        ELSE
+            EXECUTE format('DECLARE %I CURSOR FOR SELECT pgv_stats()', cname);
+        END IF;
+        EXECUTE format('MOVE 1 FROM %I', cname);
+    END LOOP;
+END
+$$;
+SAVEPOINT cap_overflow;
+DECLARE cap_cur_65 CURSOR FOR SELECT pgv_select('scan_cap', 'r');
+MOVE 1 FROM cap_cur_65;
+ROLLBACK TO cap_overflow;
+SAVEPOINT cap_overflow_stats;
+DECLARE cap_cur_65_stats CURSOR FOR SELECT * FROM pgv_stats();
+MOVE 1 FROM cap_cur_65_stats;
+ROLLBACK TO cap_overflow_stats;
+SAVEPOINT cap_subabort;
+DECLARE cap_portal CURSOR FOR SELECT 1;
+SELECT 1 / 0;
+ROLLBACK TO cap_subabort;
+COMMIT;
+SELECT pgv_free();
