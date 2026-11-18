@@ -504,3 +504,81 @@ END $$;
 CLOSE stats_snap_cur;
 COMMIT;
 SELECT pgv_free();
+
+-- Closing a child scan inside a savepoint before RELEASE or ROLLBACK TO, or
+-- rolling back an open child pgv_stats() scan, must keep parent scans valid.
+SELECT pgv_insert('multi_close', 'b', ROW(1), false);
+SELECT pgv_insert('multi_close', 'b', ROW(2), false);
+SELECT pgv_insert('multi_close', 'a', ROW(10), false);
+SELECT pgv_insert('multi_close', 'a', ROW(20), false);
+SELECT pgv_set('multi_close_2', 'x', 1, false);
+BEGIN;
+DECLARE mc_b CURSOR FOR SELECT pgv_select('multi_close', 'b');
+MOVE 1 FROM mc_b;
+DECLARE mc_a_parent CURSOR FOR SELECT pgv_select('multi_close', 'a');
+MOVE 1 FROM mc_a_parent;
+DECLARE mc_st_parent CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM mc_st_parent;
+SAVEPOINT mc_child;
+DECLARE mc_a_child CURSOR FOR SELECT pgv_select('multi_close', 'a');
+MOVE 1 FROM mc_a_child;
+DECLARE mc_st_child CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM mc_st_child;
+MOVE ALL FROM mc_b;
+CLOSE mc_b;
+CLOSE mc_a_child;
+CLOSE mc_st_child;
+RELEASE SAVEPOINT mc_child;
+DO $$
+DECLARE
+    r record;
+    pkg text;
+    ca refcursor := 'mc_a_parent';
+    cs refcursor := 'mc_st_parent';
+    na integer := 0;
+    ns integer := 0;
+BEGIN
+    LOOP FETCH ca INTO r; EXIT WHEN NOT FOUND; na := na + 1; END LOOP;
+    LOOP FETCH cs INTO pkg; EXIT WHEN NOT FOUND; ns := ns + 1; END LOOP;
+    IF na <> 1 OR ns <> 1 THEN
+        RAISE EXCEPTION 'unexpected parent rows after closed child release: %, %', na, ns;
+    END IF;
+END $$;
+CLOSE mc_a_parent;
+CLOSE mc_st_parent;
+COMMIT;
+
+BEGIN;
+DECLARE mr_b CURSOR FOR SELECT pgv_select('multi_close', 'b');
+MOVE 1 FROM mr_b;
+DECLARE mr_a_parent CURSOR FOR SELECT pgv_select('multi_close', 'a');
+MOVE 1 FROM mr_a_parent;
+DECLARE mr_st_parent CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM mr_st_parent;
+SAVEPOINT mr_child;
+DECLARE mr_a_child CURSOR FOR SELECT pgv_select('multi_close', 'a');
+MOVE 1 FROM mr_a_child;
+DECLARE mr_st_child CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM mr_st_child;
+MOVE ALL FROM mr_b;
+CLOSE mr_b;
+ROLLBACK TO SAVEPOINT mr_child;
+DO $$
+DECLARE
+    r record;
+    pkg text;
+    ca refcursor := 'mr_a_parent';
+    cs refcursor := 'mr_st_parent';
+    na integer := 0;
+    ns integer := 0;
+BEGIN
+    LOOP FETCH ca INTO r; EXIT WHEN NOT FOUND; na := na + 1; END LOOP;
+    LOOP FETCH cs INTO pkg; EXIT WHEN NOT FOUND; ns := ns + 1; END LOOP;
+    IF na <> 1 OR ns <> 1 THEN
+        RAISE EXCEPTION 'unexpected parent rows after open child rollback: %, %', na, ns;
+    END IF;
+END $$;
+CLOSE mr_a_parent;
+CLOSE mr_st_parent;
+COMMIT;
+SELECT pgv_free();

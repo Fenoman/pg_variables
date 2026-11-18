@@ -106,6 +106,8 @@ static void pushChangesStack(int level);
 static bool shouldDiscardTransactionalOnCommit(void);
 
 static int	numOfRegVars(Package *package);
+static void materialize_other_level_variable_scans(HTAB *hash, Levels *levels);
+static void materialize_other_level_package_scans(Levels *levels);
 
 #ifdef PGPRO_EE
 static void pgvSaveContext(void);
@@ -411,6 +413,11 @@ list_remove_if(RemoveIfContext ctx)
 	dlist_mutable_iter iter;
 	bool		found = false;
 
+	StaticAssertStmt(offsetof(VariableStatEntry, node) == 0,
+					 "VariableStatEntry.node must be at offset 0");
+	StaticAssertStmt(offsetof(PackageStatEntry, node) == 0,
+					 "PackageStatEntry.node must be at offset 0");
+
 	dlist_foreach_modify(iter, ctx.list)
 	{
 		void	   *entry = iter.cur;
@@ -603,7 +610,7 @@ remove_packages_level(dlist_head *list, Levels *levels)
 		.eq = PackageStatEntry_level_eq,
 		.getter = PackageStatEntry_status_ptr,
 		.match_first = false,
-		.term = true,
+		.term = false,
 		.clear_fctx = PackageStatEntry_clear_fctx,
 		.deactivate = PackageStatEntry_deactivate
 	};
@@ -1482,6 +1489,7 @@ variable_select(PG_FUNCTION_ARGS)
 		entry->callback.func = variableStatEntryShutdown;
 		entry->callback.arg = entry;
 
+		materialize_other_level_variable_scans(record->rhash, &entry->levels);
 		dlist_push_head(&variables_stats, &entry->node);
 
 		MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
@@ -2260,6 +2268,7 @@ get_packages_stats(PG_FUNCTION_ARGS)
 			entry->callback.func = packageStatEntryShutdown;
 			entry->callback.arg = entry;
 
+			materialize_other_level_package_scans(&entry->levels);
 			dlist_push_head(&packages_stats, &entry->node);
 
 			MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
@@ -3883,7 +3892,7 @@ processChanges(Action action, bool sub)
 	if (!hash_get_num_entries(packagesHash))
 	{
 		/* Terminate package scans while packagesHash header is still valid. */
-		remove_packages_all(&packages_stats);
+		remove_packages_unmaterialized(&packages_stats);
 		MemoryContextDelete(ModuleContext);
 		packagesHash = NULL;
 		ModuleContext = NULL;
@@ -4368,7 +4377,7 @@ pgvRestoreContext(bool committed)
 	if (changesStack == NULL && pgv_context == NULL &&
 		packagesHash != NULL && !hash_get_num_entries(packagesHash))
 	{
-		remove_packages_all(&packages_stats);
+		remove_packages_unmaterialized(&packages_stats);
 		MemoryContextDelete(ModuleContext);
 		packagesHash = NULL;
 		ModuleContext = NULL;
@@ -4526,6 +4535,123 @@ preserve_subtransaction_scans(Levels *levels)
 			entry->status = NULL;
 			entry->materialize = false;
 		}
+	}
+}
+
+static void
+materialize_other_level_variable_scans(HTAB *hash, Levels *levels)
+{
+	dlist_iter	iter;
+	bool		any_marked = false;
+
+	dlist_foreach(iter, &variables_stats)
+	{
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
+		MemoryContext context;
+
+		entry->materialize = false;
+		if (!entry->active || !entry->status || entry->hash != hash ||
+			VariableStatEntry_level_eq(entry, levels))
+			continue;
+
+		if (entry->rows != NULL)
+		{
+			pfree(entry->rows);
+			entry->rows = NULL;
+		}
+		entry->num_rows = 0;
+		entry->next_row = 0;
+		context = GetMemoryChunkContext(entry);
+		entry->rows = MemoryContextAlloc(context,
+										mul_size(sizeof(HashRecordEntry *),
+												 hash_get_num_entries(entry->hash)));
+		entry->materialize = true;
+		any_marked = true;
+	}
+
+	if (!any_marked)
+		return;
+
+	dlist_foreach(iter, &variables_stats)
+	{
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
+		HashRecordEntry *item;
+
+		if (!entry->materialize)
+			continue;
+
+		while ((item = hash_seq_search(entry->status)) != NULL)
+			entry->rows[entry->num_rows++] = item;
+		entry->status = NULL;
+		entry->materialize = false;
+	}
+}
+
+static void
+materialize_other_level_package_scans(Levels *levels)
+{
+	dlist_iter	iter;
+	bool		any_marked = false;
+	Size		snap_bytes;
+
+	if (dlist_is_empty(&packages_stats))
+		return;
+
+	snap_bytes = mul_size(sizeof(PackageStatSnapshot),
+						  hash_get_num_entries(packagesHash));
+	dlist_foreach(iter, &packages_stats)
+	{
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
+		MemoryContext context;
+
+		entry->materialize = false;
+		if (!entry->active || !entry->status ||
+			PackageStatEntry_level_eq(entry, levels))
+			continue;
+
+		if (entry->rows != NULL)
+		{
+			pfree(entry->rows);
+			entry->rows = NULL;
+		}
+		entry->num_rows = 0;
+		entry->next_row = 0;
+		context = GetMemoryChunkContext(entry);
+		entry->rows = MemoryContextAlloc(context, snap_bytes);
+		entry->materialize = true;
+		any_marked = true;
+	}
+
+	if (!any_marked)
+		return;
+
+	dlist_foreach(iter, &packages_stats)
+	{
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
+		Package    *package;
+
+		if (!entry->materialize)
+			continue;
+
+		while ((package = hash_seq_search(entry->status)) != NULL)
+		{
+			Size		regularSpace = 0,
+						transactSpace = 0;
+			PackageStatSnapshot *snap = &entry->rows[entry->num_rows++];
+
+			strlcpy(snap->name, GetName(package), NAMEDATALEN);
+			if (package->hctxRegular)
+				getMemoryTotalSpace(package->hctxRegular, 0, &regularSpace);
+			if (package->hctxTransact)
+				getMemoryTotalSpace(package->hctxTransact, 0, &transactSpace);
+			snap->used_memory = regularSpace + transactSpace;
+		}
+		entry->status = NULL;
+		entry->materialize = false;
 	}
 }
 
