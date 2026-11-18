@@ -737,3 +737,112 @@ DO $$ BEGIN
     END IF;
 END $$;
 SELECT pgv_free();
+
+-- Same-name regular and new-type transactional reuse in parent after committed
+-- child ATX package removal.
+BEGIN;
+SELECT pgv_set('atx_same_name', 'x', 1, true);
+SELECT pgv_set('atx_same_name', 'old_txt', 'abc'::text, true);
+SELECT pgv_set('atx_same_name', 'seed', 1, false);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_same_name');
+SELECT pgv_set('atx_same_name', 'x', 2, false);
+COMMIT;
+SELECT pgv_get('atx_same_name', 'x', NULL::integer) AS x_from_child;
+SELECT pgv_set('atx_same_name', 'x', 3, false);
+SELECT pgv_set('atx_same_name', 'old_txt', 456, true);
+DO $$ BEGIN
+    IF pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
+       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1 THEN
+        RAISE EXCEPTION 'parent same-name reuse after ATX package removal failed';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+-- Child ATX must reject regular creation of a live parent transactional name
+-- unless the package was removed, and an aborted ATX after removal+recreation
+-- must not leave duplicate variable names in pgv_list().
+BEGIN;
+SELECT pgv_set('atx_opp_guard', 'seed', 0, false);
+SELECT pgv_set('atx_opp_guard', 'x', 10, true);
+SELECT pgv_set('atx_opp_guard', 'keep_tx', 20, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_opp_guard', 'x', 99, false);
+ROLLBACK;
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_opp_guard');
+SELECT pgv_set('atx_opp_guard', 'x', 77, false);
+ROLLBACK;
+DO $$ BEGIN
+    IF pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
+       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1 THEN
+        RAISE EXCEPTION 'aborted ATX left duplicate name or lost non-colliding transactional var';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+-- Multiple parent PackStates and nested committed ATX removal inside aborted ATX.
+BEGIN;
+SELECT pgv_set('atx_multi_ps', 'seed', 0, false);
+SELECT pgv_set('atx_multi_ps', 'tx1', 1, true);
+SAVEPOINT sp_new_tx;
+SELECT pgv_set('atx_multi_ps', 'tx2', 2, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_multi_ps');
+SELECT pgv_set('atx_multi_ps', 'reg', 50, false);
+COMMIT;
+SELECT pgv_set('atx_multi_ps', 'tx3', 3, true);
+ROLLBACK TO sp_new_tx;
+DO $$ BEGIN
+    IF pgv_exists('atx_multi_ps', 'tx1') OR
+       pgv_exists('atx_multi_ps', 'tx2') OR
+       pgv_exists('atx_multi_ps', 'tx3') OR
+       pgv_get('atx_multi_ps', 'reg', NULL::integer, false) IS DISTINCT FROM 50 THEN
+        RAISE EXCEPTION 'multi-PackState rollback after ATX removal failed';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+BEGIN;
+SELECT pgv_set('atx_nested_rm', 'seed', 0, false);
+SELECT pgv_set('atx_nested_rm', 'tx', 11, true);
+BEGIN AUTONOMOUS;
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_nested_rm');
+COMMIT;
+ROLLBACK;
+DO $$ BEGIN
+    IF pgv_exists('atx_nested_rm', 'tx') OR pgv_exists('atx_nested_rm') THEN
+        RAISE EXCEPTION 'committed inner ATX removal was lost when outer ATX rolled back';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+-- Level-0 regular packages emptied in child ATX must disappear from pgv_stats()
+-- even when parent modified an unrelated package or child used pgv_remove(pkg, var).
+SELECT pgv_set('atx_dead_l0_a', 'v', 1, false);
+SELECT pgv_set('atx_dead_l0_b', 'v', 2, false);
+BEGIN;
+SELECT pgv_set('atx_unrelated_tx', 'tx', 10, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_dead_l0_a');
+SELECT pgv_remove('atx_dead_l0_b', 'v');
+COMMIT;
+DO $$ BEGIN
+    IF (SELECT count(*) FROM pgv_stats() WHERE package IN ('atx_dead_l0_a', 'atx_dead_l0_b')) <> 0 THEN
+        RAISE EXCEPTION 'emptied level-0 regular packages remained in pgv_stats';
+    END IF;
+END $$;
+COMMIT;
+DO $$ BEGIN
+    IF (SELECT count(*) FROM pgv_stats() WHERE package IN ('atx_dead_l0_a', 'atx_dead_l0_b')) <> 0 THEN
+        RAISE EXCEPTION 'emptied level-0 regular packages remained in pgv_stats after commit';
+    END IF;
+END $$;
+SELECT pgv_free();

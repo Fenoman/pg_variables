@@ -119,6 +119,7 @@ typedef struct PackageContext
 	MemoryContext hctxTransact;
 	TransState *state;
 	TransState *atx_state;
+	bool		child_committed_remove;
 	struct PackageContext *next;
 }			PackageContext;
 #endif

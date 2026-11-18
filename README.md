@@ -403,8 +403,15 @@ backend-local restriction, not support for transferring variables through 2PC.
 In Enterprise, transactional state is isolated across autonomous transactions.
 Entering an autonomous transaction ends open transactional record scans in the
 parent. Parent regular record and statistics scans continue while their sources
-remain alive. Regular changes survive autonomous COMMIT and ABORT. Transactional
-values created inside an autonomous transaction do not escape to its parent.
+remain alive.
+
+Regular changes survive autonomous `COMMIT` and `ABORT`. Transactional values
+created inside an autonomous transaction do not escape to its parent.
+
+A committed `pgv_remove(package)` or `pgv_free()` inside an autonomous
+transaction invalidates suspended parent transactional values of the removed
+packages. An aborted autonomous transaction preserves non-colliding parent
+transactional values.
 
 Record hash and comparison functions may read variables and modify independent
 variables, including inside autonomous transactions. They cannot mutate a

@@ -1380,3 +1380,283 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Same-name regular and new-type transactional reuse in parent after committed
+-- child ATX package removal.
+BEGIN;
+SELECT pgv_set('atx_same_name', 'x', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_same_name', 'old_txt', 'abc'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_same_name', 'seed', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_same_name');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT pgv_set('atx_same_name', 'x', 2, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+SELECT pgv_get('atx_same_name', 'x', NULL::integer) AS x_from_child;
+ERROR:  unrecognized variable "x"
+SELECT pgv_set('atx_same_name', 'x', 3, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_same_name', 'old_txt', 456, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+DO $$ BEGIN
+    IF pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
+       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1 THEN
+        RAISE EXCEPTION 'parent same-name reuse after ATX package removal failed';
+    END IF;
+END $$;
+ERROR:  unrecognized variable "old_txt"
+CONTEXT:  PL/pgSQL expression "pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
+       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1"
+PL/pgSQL function inline_code_block line 2 at IF
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Child ATX must reject regular creation of a live parent transactional name
+-- unless the package was removed, and an aborted ATX after removal+recreation
+-- must not leave duplicate variable names in pgv_list().
+BEGIN;
+SELECT pgv_set('atx_opp_guard', 'seed', 0, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_opp_guard', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_opp_guard', 'keep_tx', 20, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_opp_guard', 'x', 99, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK;
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_opp_guard');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_set('atx_opp_guard', 'x', 77, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK;
+WARNING:  there is no transaction in progress
+DO $$ BEGIN
+    IF pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
+       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1 THEN
+        RAISE EXCEPTION 'aborted ATX left duplicate name or lost non-colliding transactional var';
+    END IF;
+END $$;
+ERROR:  unrecognized variable "keep_tx"
+CONTEXT:  PL/pgSQL expression "pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
+       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
+       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1"
+PL/pgSQL function inline_code_block line 2 at IF
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Multiple parent PackStates and nested committed ATX removal inside aborted ATX.
+BEGIN;
+SELECT pgv_set('atx_multi_ps', 'seed', 0, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_multi_ps', 'tx1', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT sp_new_tx;
+SELECT pgv_set('atx_multi_ps', 'tx2', 2, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_multi_ps');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT pgv_set('atx_multi_ps', 'reg', 50, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+SELECT pgv_set('atx_multi_ps', 'tx3', 3, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO sp_new_tx;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+DO $$ BEGIN
+    IF pgv_exists('atx_multi_ps', 'tx1') OR
+       pgv_exists('atx_multi_ps', 'tx2') OR
+       pgv_exists('atx_multi_ps', 'tx3') OR
+       pgv_get('atx_multi_ps', 'reg', NULL::integer, false) IS DISTINCT FROM 50 THEN
+        RAISE EXCEPTION 'multi-PackState rollback after ATX removal failed';
+    END IF;
+END $$;
+ERROR:  multi-PackState rollback after ATX removal failed
+CONTEXT:  PL/pgSQL function inline_code_block line 6 at RAISE
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('atx_nested_rm', 'seed', 0, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_nested_rm', 'tx', 11, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_nested_rm');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+ROLLBACK;
+WARNING:  there is no transaction in progress
+DO $$ BEGIN
+    IF pgv_exists('atx_nested_rm', 'tx') OR pgv_exists('atx_nested_rm') THEN
+        RAISE EXCEPTION 'committed inner ATX removal was lost when outer ATX rolled back';
+    END IF;
+END $$;
+ERROR:  committed inner ATX removal was lost when outer ATX rolled back
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Level-0 regular packages emptied in child ATX must disappear from pgv_stats()
+-- even when parent modified an unrelated package or child used pgv_remove(pkg, var).
+SELECT pgv_set('atx_dead_l0_a', 'v', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_dead_l0_b', 'v', 2, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('atx_unrelated_tx', 'tx', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_dead_l0_a');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT pgv_remove('atx_dead_l0_b', 'v');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+DO $$ BEGIN
+    IF (SELECT count(*) FROM pgv_stats() WHERE package IN ('atx_dead_l0_a', 'atx_dead_l0_b')) <> 0 THEN
+        RAISE EXCEPTION 'emptied level-0 regular packages remained in pgv_stats';
+    END IF;
+END $$;
+ERROR:  emptied level-0 regular packages remained in pgv_stats
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+COMMIT;
+WARNING:  there is no transaction in progress
+DO $$ BEGIN
+    IF (SELECT count(*) FROM pgv_stats() WHERE package IN ('atx_dead_l0_a', 'atx_dead_l0_b')) <> 0 THEN
+        RAISE EXCEPTION 'emptied level-0 regular packages remained in pgv_stats after commit';
+    END IF;
+END $$;
+ERROR:  emptied level-0 regular packages remained in pgv_stats after commit
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

@@ -109,7 +109,7 @@ static int	numOfRegVars(Package *package);
 
 #ifdef PGPRO_EE
 static void pgvSaveContext(void);
-static void pgvRestoreContext(void);
+static void pgvRestoreContext(bool committed);
 #endif
 
 /* Constructors */
@@ -2679,6 +2679,24 @@ getVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 	return variable;
 }
 
+static bool
+hasAnyValidState(Variable *variable)
+{
+	dlist_iter	iter;
+
+	if (!variable->is_transactional)
+		return isVariableValid(variable);
+
+	dlist_foreach(iter, &variable->transObject.states)
+	{
+		TransState *state = dlist_container(TransState, node, iter.cur);
+
+		if (state->is_valid)
+			return true;
+	}
+	return false;
+}
+
 /*
  * Create a variable or return a pointer to existing one.
  * Function is useful to set new value to variable and flag 'is_transactional'
@@ -2704,13 +2722,50 @@ createVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 	htab = pack_htab(package, !is_transactional);
 	if (htab)
 	{
-		hash_search(htab, key, HASH_FIND, &found);
-		if (found)
+		Variable   *opp_var;
+
+		opp_var = (Variable *) hash_search(htab, key, HASH_FIND, &found);
+		if (found && hasAnyValidState(opp_var))
+		{
+			if (isPackageEmpty(package) &&
+				isObjectChangedInCurrentTrans(&package->transObject))
+				GetActualState(&package->transObject)->is_valid = false;
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("variable \"%s\" already created as %sTRANSACTIONAL",
 							key, is_transactional ? "NOT " : "")));
+		}
 	}
+#ifdef PGPRO_EE
+	if (!is_transactional && !GetPackState(package)->atx_removed)
+	{
+		PackageContext *ctx;
+
+		for (ctx = package->context; ctx != NULL; ctx = ctx->next)
+		{
+			if (ctx->child_committed_remove)
+				break;
+			if (ctx->varHashTransact != NULL &&
+				!((PackState *) ctx->state)->is_removed)
+			{
+				Variable   *opp_var;
+
+				opp_var = (Variable *) hash_search(ctx->varHashTransact, key,
+												   HASH_FIND, &found);
+				if (found && hasAnyValidState(opp_var))
+				{
+					if (isPackageEmpty(package) &&
+						isObjectChangedInCurrentTrans(&package->transObject))
+						GetActualState(&package->transObject)->is_valid = false;
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("variable \"%s\" already created as TRANSACTIONAL",
+									key)));
+				}
+			}
+		}
+	}
+#endif
 
 	variable = (Variable *) hash_search(pack_htab(package, is_transactional),
 										key, HASH_ENTER, &found);
@@ -3971,10 +4026,6 @@ pgvSaveContext(void)
 			pfree(saved_pkgs);
 	}
 
-	/* Remove stats for all transactional variables */
-	remove_variables_transactional(&variables_stats);
-	resetVariablesCache();
-
 	sus->changesStack = changesStack;
 	changesStack = NULL;
 	sus->changesStackContext = changesStackContext;
@@ -3984,56 +4035,116 @@ pgvSaveContext(void)
 	sus->next = pgv_context;
 	pgv_context = sus;
 	active_atx_level = getNestLevelATX();
+
+	/* Remove stats for all transactional variables */
+	remove_variables_transactional(&variables_stats);
+	resetVariablesCache();
+}
+
+static void
+purgeVariableFromChangesStack(dlist_head *stack, Variable *variable)
+{
+	dlist_iter	siter;
+
+	if (stack == NULL)
+		return;
+
+	dlist_foreach(siter, stack)
+	{
+		ChangesStackNode *csn = dlist_container(ChangesStackNode, node,
+												siter.cur);
+		dlist_mutable_iter citer;
+
+		dlist_foreach_modify(citer, csn->changedVarsList)
+		{
+			ChangedObject *co = dlist_container(ChangedObject, node,
+												citer.cur);
+
+			if ((Variable *) co->object == variable)
+			{
+				dlist_delete(citer.cur);
+				pfree(co);
+			}
+		}
+	}
+}
+
+static void
+purgePackageVarsFromChangesStack(dlist_head *stack, Package *package)
+{
+	dlist_iter	siter;
+
+	if (stack == NULL)
+		return;
+
+	dlist_foreach(siter, stack)
+	{
+		ChangesStackNode *csn = dlist_container(ChangesStackNode, node,
+												siter.cur);
+		dlist_mutable_iter citer;
+
+		dlist_foreach_modify(citer, csn->changedVarsList)
+		{
+			ChangedObject *co = dlist_container(ChangedObject, node,
+												citer.cur);
+
+			if (((Variable *) co->object)->package == package)
+			{
+				dlist_delete(citer.cur);
+				pfree(co);
+			}
+		}
+	}
+}
+
+static bool
+isPackageInChangesStack(dlist_head *stack, Package *package)
+{
+	dlist_iter	siter;
+
+	if (stack == NULL)
+		return false;
+
+	dlist_foreach(siter, stack)
+	{
+		ChangesStackNode *csn = dlist_container(ChangesStackNode, node,
+												siter.cur);
+		dlist_iter	citer;
+
+		dlist_foreach(citer, csn->changedPacksList)
+		{
+			ChangedObject *co = dlist_container(ChangedObject, node,
+												citer.cur);
+
+			if ((Package *) co->object == package)
+				return true;
+		}
+		dlist_foreach(citer, csn->changedVarsList)
+		{
+			ChangedObject *co = dlist_container(ChangedObject, node,
+												citer.cur);
+
+			if (((Variable *) co->object)->package == package)
+				return true;
+		}
+	}
+	return false;
 }
 
 static void
 invalidateParentPackageInATXRestore(Package *package, int parent_atxlevel,
-									bool parent_has_stack)
+									dlist_head *parent_stack)
 {
 	TransObject *object = &package->transObject;
 	dlist_iter	piter;
 
-	if (package->varHashTransact != NULL)
+	if (package->hctxTransact != NULL)
 	{
-		if (!parent_has_stack && package->context == NULL)
-		{
-			remove_variables_package(&variables_stats, package);
-			MemoryContextDelete(package->hctxTransact);
-			package->hctxTransact = NULL;
-			package->varHashTransact = NULL;
-		}
-		else
-		{
-			HASH_SEQ_STATUS vstat;
-			Variable   *variable;
-
-			hash_seq_init(&vstat, package->varHashTransact);
-			while ((variable = (Variable *) hash_seq_search(&vstat)) != NULL)
-			{
-				dlist_iter	viter;
-
-				remove_variables_variable(&variables_stats, variable);
-				dlist_foreach(viter, &variable->transObject.states)
-				{
-					VarState   *vs = dlist_container(VarState, state.node, viter.cur);
-
-					if (variable->is_record && vs->value.record.rhash)
-						remove_variables_hash(&variables_stats,
-											  vs->value.record.rhash);
-					freeValue(vs, variable->is_record);
-					if (variable->is_record)
-						memset(&vs->value.record, 0, sizeof(RecordVar));
-					else
-					{
-						vs->value.scalar.value = 0;
-						vs->value.scalar.is_null = true;
-					}
-					vs->state.is_valid = false;
-					vs->package_removal_level = 1;
-				}
-				variable->is_deleted = true;
-			}
-		}
+		remove_variables_transactional(&variables_stats);
+		purgePackageVarsFromChangesStack(parent_stack, package);
+		MemoryContextDelete(package->hctxTransact);
+		package->hctxTransact = NULL;
+		package->varHashTransact = NULL;
 	}
 
 	dlist_foreach(piter, &object->states)
@@ -4050,17 +4161,77 @@ invalidateParentPackageInATXRestore(Package *package, int parent_atxlevel,
 	}
 }
 
+static void
+deduplicateRestoredTransactVars(Package *package, int parent_atxlevel,
+								dlist_head *parent_stack)
+{
+	HASH_SEQ_STATUS rstat;
+	Variable   *reg_var;
+
+	if (package->varHashRegular == NULL || package->varHashTransact == NULL)
+		return;
+
+	hash_seq_init(&rstat, package->varHashRegular);
+	while ((reg_var = (Variable *) hash_seq_search(&rstat)) != NULL)
+	{
+		Variable   *tx_var;
+		bool		found;
+		bool		removed;
+		dlist_iter	piter;
+
+		tx_var = (Variable *) hash_search(package->varHashTransact,
+										  GetName(reg_var),
+										  HASH_FIND, &found);
+		if (!found)
+			continue;
+
+		dlist_foreach(piter, &package->transObject.states)
+		{
+			PackState  *ps = dlist_container(PackState, state.node,
+											 piter.cur);
+			dlist_iter	viter;
+			bool		was_valid = false;
+
+			if (ps->state.levels.atxlevel != parent_atxlevel)
+				break;
+
+			dlist_foreach(viter, &tx_var->transObject.states)
+			{
+				VarState   *vs = dlist_container(VarState, state.node,
+												 viter.cur);
+
+				if (vs->state.levels.level <= ps->state.levels.level)
+				{
+					was_valid = vs->state.is_valid;
+					break;
+				}
+			}
+			if (was_valid && ps->trans_var_num > 0)
+				ps->trans_var_num--;
+			ps->state.is_valid = (ps->trans_var_num + numOfRegVars(package) > 0);
+		}
+
+		remove_variables_variable(&variables_stats, tx_var);
+		purgeVariableFromChangesStack(parent_stack, tx_var);
+		while (!dlist_is_empty(&tx_var->transObject.states))
+			removeState(&tx_var->transObject, TRANS_VARIABLE,
+						GetActualState(tx_var));
+		hash_search(package->varHashTransact, GetName(tx_var),
+					HASH_REMOVE, &removed);
+	}
+}
+
 /*
  * Restore pg_variables's env pointer from pgv_context.
  */
 static void
-pgvRestoreContext(void)
+pgvRestoreContext(bool committed)
 {
 	Package    *package;
 	HASH_SEQ_STATUS pstat;
 	PgvContextStruct *sus = pgv_context;
 	int			parent_atxlevel = sus ? sus->atxlevel : getNestLevelATX() - 1;
-	bool		parent_has_stack = (sus != NULL && sus->changesStack != NULL);
+	dlist_head *parent_stack = sus ? sus->changesStack : NULL;
 
 	if (getNestLevelATX() > active_atx_level)
 		return;
@@ -4098,6 +4269,8 @@ pgvRestoreContext(void)
 				TransObject *object = &package->transObject;
 				TransState *state;
 				bool		atx_removed = GetPackState(package)->atx_removed;
+				bool		effective_remove = context->child_committed_remove ||
+					(committed && atx_removed);
 
 				/* Restore transactional variables from context */
 				package->hctxTransact = context->hctxTransact;
@@ -4115,10 +4288,18 @@ pgvRestoreContext(void)
 				pfree(context);
 				package->context = next;
 
-				if (atx_removed)
+				if (effective_remove)
+				{
+					if (package->context != NULL)
+						package->context->child_committed_remove = true;
 					invalidateParentPackageInATXRestore(package,
 														parent_atxlevel,
-														parent_has_stack);
+														parent_stack);
+				}
+				else
+					deduplicateRestoredTransactVars(package,
+													parent_atxlevel,
+													parent_stack);
 
 				GetActualState(object)->is_valid =
 					(GetPackState(package)->trans_var_num + numOfRegVars(package) > 0);
@@ -4129,9 +4310,10 @@ pgvRestoreContext(void)
 				 */
 				if (!GetActualState(object)->is_valid &&
 					package->context == NULL &&
-					package->varHashRegular == NULL &&
-					package->varHashTransact == NULL &&
-					!parent_has_stack &&
+					numOfRegVars(package) == 0 &&
+					(package->varHashTransact == NULL ||
+					 hash_get_num_entries(package->varHashTransact) == 0) &&
+					!isPackageInChangesStack(parent_stack, package) &&
 					!dlist_has_next(&object->states, dlist_head_node(&object->states)) &&
 					GetActualState(object)->levels.level == 0)
 				{
@@ -4487,7 +4669,10 @@ pgvTransCallback(XactEvent event, void *arg)
 				  event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
 				  event == XACT_EVENT_PREPARE))
 		{						/* on each ATX transaction finish */
-			pgvRestoreContext();
+			bool		committed = (event == XACT_EVENT_COMMIT ||
+									 event == XACT_EVENT_PARALLEL_COMMIT);
+
+			pgvRestoreContext(committed);
 		}
 	}
 #endif

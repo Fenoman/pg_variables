@@ -222,3 +222,28 @@ DO $$ BEGIN
 END $$;
 ROLLBACK;
 SELECT pgv_free();
+
+-- Removing a transactional variable that has no older valid savepoint state
+-- allows reusing its name for a regular variable, whereas an older valid state
+-- across a savepoint still blocks opposite-mode creation.
+BEGIN;
+SELECT pgv_set('opp_same_lvl', 'x', 1, true);
+SELECT pgv_remove('opp_same_lvl', 'x');
+SELECT pgv_set('opp_same_lvl', 'x', 2, false);
+DO $$ BEGIN
+ IF pgv_get('opp_same_lvl', 'x', NULL::integer) IS DISTINCT FROM 2 OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'opp_same_lvl' AND name = 'x') <> 1 THEN
+  RAISE EXCEPTION 'same-level tombstoned transactional variable blocked regular reuse';
+ END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+BEGIN;
+SELECT pgv_set('opp_sp_lvl', 'x', 1, true);
+SAVEPOINT opp_sp;
+SELECT pgv_remove('opp_sp_lvl', 'x');
+SELECT pgv_set('opp_sp_lvl', 'x', 2, false);
+ROLLBACK TO opp_sp;
+SELECT pgv_get('opp_sp_lvl', 'x', NULL::integer) AS x_restored;
+COMMIT;
+SELECT pgv_free();
