@@ -161,23 +161,24 @@ static dlist_head *changesStack = NULL;
 static MemoryContext changesStackContext = NULL;
 
 /*
- * List to store all the running hash_seq_search, variable and package scan for
- * hash table.
+ * Intrusive doubly-linked lists of active variable and package scans.
  *
- * NOTE: In function variable_select we use hash_seq_search to find next tuple.
- * So, in case user do not get all the data from set at once (use cursors or
- * LIMIT) we have to call hash_seq_term to not to leak hash_seq_search scans.
- *
- * For doing this, we keep global list cells in TopTransactionContext and
- * make SRF memory context callbacks remove entries from these lists. Once
- * transaction ended (committed or aborted) we clear all the active entries
- * still present in these lists.
+ * Keeping the list linkage inside each entry avoids TopTransactionContext
+ * allocations and DEBUG_LIST_MEMORY_USAGE reallocations when scans close
+ * during savepoint release, rollback, or transaction cleanup.
  */
-static List *variables_stats = NIL;
-static List *packages_stats = NIL;
+static dlist_head variables_stats = DLIST_STATIC_INIT(variables_stats);
+static dlist_head packages_stats = DLIST_STATIC_INIT(packages_stats);
+
+typedef struct tagPackageStatSnapshot
+{
+	char		name[NAMEDATALEN];
+	Size		used_memory;
+}			PackageStatSnapshot;
 
 typedef struct tagVariableStatEntry
 {
+	dlist_node	node;
 	HTAB	   *hash;
 	HASH_SEQ_STATUS *status;
 	Variable   *variable;
@@ -186,6 +187,7 @@ typedef struct tagVariableStatEntry
 	void	  **user_fctx; /* pointer to funcctx->user_fctx */
 	bool		active;
 	bool		full_scan;
+	bool		materialize;
 	HashRecordEntry **rows;
 	long		num_rows;
 	long		next_row;
@@ -194,12 +196,13 @@ typedef struct tagVariableStatEntry
 
 typedef struct tagPackageStatEntry
 {
+	dlist_node	node;
 	HASH_SEQ_STATUS *status;
 	Levels		levels;
 	void	  **user_fctx; /* pointer to funcctx->user_fctx */
 	bool		active;
-	TupleDesc	tupdesc;
-	Datum	   *rows;
+	bool		materialize;
+	PackageStatSnapshot *rows;
 	long		num_rows;
 	long		next_row;
 	MemoryContextCallback callback;
@@ -289,6 +292,12 @@ static bool
 PackageStatEntry_eq_all(void *entry, void *value)
 {
 	return true;
+}
+
+static bool
+PackageStatEntry_has_status(void *entry, void *value)
+{
+	return ((PackageStatEntry *) entry)->status != NULL;
 }
 
 static bool
@@ -386,7 +395,7 @@ PackageStatEntry_deactivate(void *entry)
  */
 typedef struct tagRemoveIfContext
 {
-	List	  **list;			/* target list */
+	dlist_head *list;			/* target list */
 	void	   *value;			/* value to compare with */
 	bool		(*eq) (void *, void *); /* list item eq to value func */
 	HASH_SEQ_STATUS *(*getter) (void *);	/* status getter */
@@ -399,60 +408,16 @@ typedef struct tagRemoveIfContext
 static bool
 list_remove_if(RemoveIfContext ctx)
 {
+	dlist_mutable_iter iter;
 	bool		found = false;
 
-#if (PG_VERSION_NUM < 130000)
-	ListCell   *cell,
-			   *next,
-			   *prev = NULL;
-	void	   *entry = NULL;
-
-	for (cell = list_head(*ctx.list); cell; cell = next)
+	dlist_foreach_modify(iter, ctx.list)
 	{
-		entry = lfirst(cell);
-		next = lnext(cell);
+		void	   *entry = iter.cur;
 
 		if (ctx.eq(entry, ctx.value))
 		{
-			*ctx.list = list_delete_cell(*ctx.list, cell, prev);
-
-			if (ctx.term && ctx.getter(entry))
-#ifdef PGPRO_EE
-				hash_seq_term_all_levels(ctx.getter(entry));
-#else
-				hash_seq_term(ctx.getter(entry));
-#endif
-
-			ctx.clear_fctx(entry);
-			ctx.deactivate(entry);
-
-			if (ctx.match_first)
-				return true;
-
-			found = true;
-		}
-		else
-		{
-			prev = cell;
-		}
-	}
-#else
-	/*
-	 * See
-	 * https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=1cff1b95ab6ddae32faa3efe0d95a820dbfdc164
-	 *
-	 * Version >= 13 have different lists interface.
-	 */
-	ListCell   *cell;
-	void	   *entry = NULL;
-
-	foreach(cell, *ctx.list)
-	{
-		entry = lfirst(cell);
-
-		if (ctx.eq(entry, ctx.value))
-		{
-			*ctx.list = foreach_delete_current(*ctx.list, cell);
+			dlist_delete(iter.cur);
 
 			if (ctx.term && ctx.getter(entry))
 #ifdef PGPRO_EE
@@ -470,7 +435,6 @@ list_remove_if(RemoveIfContext ctx)
 			found = true;
 		}
 	}
-#endif
 
 	return found;
 }
@@ -479,7 +443,7 @@ list_remove_if(RemoveIfContext ctx)
  * Remove first entry for status.
  */
 static void
-remove_variables_status(List **list, HASH_SEQ_STATUS *status)
+remove_variables_status(dlist_head *list, HASH_SEQ_STATUS *status)
 {
 	RemoveIfContext ctx =
 	{
@@ -500,7 +464,7 @@ remove_variables_status(List **list, HASH_SEQ_STATUS *status)
  * Remove first entry for variable.
  */
 static void
-remove_variables_variable(List **list, Variable *variable)
+remove_variables_variable(dlist_head *list, Variable *variable)
 {
 	/*
 	 * It may be more than one item in the list for each variable in case of
@@ -525,7 +489,7 @@ remove_variables_variable(List **list, Variable *variable)
  * Remove all the entries for record hash.
  */
 static void
-remove_variables_hash(List **list, HTAB *hash)
+remove_variables_hash(dlist_head *list, HTAB *hash)
 {
 	RemoveIfContext ctx =
 	{
@@ -546,7 +510,7 @@ remove_variables_hash(List **list, HTAB *hash)
  * Remove all the entries for package.
  */
 static void
-remove_variables_package(List **list, Package *package)
+remove_variables_package(dlist_head *list, Package *package)
 {
 	RemoveIfContext ctx =
 	{
@@ -567,7 +531,7 @@ remove_variables_package(List **list, Package *package)
  * Remove all the entries for level.
  */
 static void
-remove_variables_level(List **list, Levels *levels)
+remove_variables_level(dlist_head *list, Levels *levels)
 {
 	RemoveIfContext ctx =
 	{
@@ -588,7 +552,7 @@ remove_variables_level(List **list, Levels *levels)
  * Delete variables stats list.
  */
 static void
-remove_variables_all(List **list)
+remove_variables_all(dlist_head *list)
 {
 	RemoveIfContext ctx =
 	{
@@ -609,7 +573,7 @@ remove_variables_all(List **list)
  * Remove first entrie with status for packages list.
  */
 static void
-remove_packages_status(List **list, HASH_SEQ_STATUS *status)
+remove_packages_status(dlist_head *list, HASH_SEQ_STATUS *status)
 {
 	RemoveIfContext ctx =
 	{
@@ -630,7 +594,7 @@ remove_packages_status(List **list, HASH_SEQ_STATUS *status)
  * Remove all the entries with level for packages list.
  */
 static void
-remove_packages_level(List **list, Levels *levels)
+remove_packages_level(dlist_head *list, Levels *levels)
 {
 	RemoveIfContext ctx =
 	{
@@ -651,7 +615,7 @@ remove_packages_level(List **list, Levels *levels)
  * Remove all the entries for packages stats list.
  */
 static void
-remove_packages_all(List **list)
+remove_packages_all(dlist_head *list)
 {
 	RemoveIfContext ctx =
 	{
@@ -668,12 +632,30 @@ remove_packages_all(List **list)
 	list_remove_if(ctx);
 }
 
+static void
+remove_packages_unmaterialized(dlist_head *list)
+{
+	RemoveIfContext ctx =
+	{
+		.list = list,
+		.value = NULL,
+		.eq = PackageStatEntry_has_status,
+		.getter = PackageStatEntry_status_ptr,
+		.match_first = false,
+		.term = true,
+		.clear_fctx = PackageStatEntry_clear_fctx,
+		.deactivate = PackageStatEntry_deactivate
+	};
+
+	list_remove_if(ctx);
+}
+
 #ifdef PGPRO_EE
 /*
  * Remove all transactional entries.
  */
 static void
-remove_variables_transactional(List **list)
+remove_variables_transactional(dlist_head *list)
 {
 	RemoveIfContext ctx =
 	{
@@ -694,7 +676,7 @@ remove_variables_transactional(List **list)
  * Remove the variables entries started at ATX level atxlevel or deeper.
  */
 static void
-remove_variables_atxlevel(List **list, int atxlevel)
+remove_variables_atxlevel(dlist_head *list, int atxlevel)
 {
 	RemoveIfContext ctx =
 	{
@@ -715,7 +697,7 @@ remove_variables_atxlevel(List **list, int atxlevel)
  * Remove the packages entries started at ATX level atxlevel or deeper.
  */
 static void
-remove_packages_atxlevel(List **list, int atxlevel)
+remove_packages_atxlevel(dlist_head *list, int atxlevel)
 {
 	RemoveIfContext ctx =
 	{
@@ -1396,12 +1378,13 @@ variable_delete(PG_FUNCTION_ARGS)
 void
 check_record_delete_allowed(Variable *variable)
 {
-	ListCell   *cell;
+	dlist_iter	iter;
 	HTAB	   *hash = GetActualValue(variable).record.rhash;
 
-	foreach(cell, variables_stats)
+	dlist_foreach(iter, &variables_stats)
 	{
-		VariableStatEntry *entry = lfirst(cell);
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
 
 		if (entry->active && entry->full_scan && entry->hash == hash)
 			ereport(ERROR,
@@ -1422,19 +1405,21 @@ check_record_delete_allowed(Variable *variable)
 static void
 check_open_seq_scans_limit(void)
 {
-	ListCell   *cell;
+	dlist_iter	iter;
 	int			active_scans = 0;
 
-	foreach(cell, variables_stats)
+	dlist_foreach(iter, &variables_stats)
 	{
-		VariableStatEntry *entry = (VariableStatEntry *) lfirst(cell);
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
 
 		if (entry->active && entry->status != NULL)
 			active_scans++;
 	}
-	foreach(cell, packages_stats)
+	dlist_foreach(iter, &packages_stats)
 	{
-		PackageStatEntry *entry = (PackageStatEntry *) lfirst(cell);
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
 
 		if (entry->active && entry->status != NULL)
 			active_scans++;
@@ -1458,7 +1443,6 @@ variable_select(PG_FUNCTION_ARGS)
 	if (SRF_IS_FIRSTCALL())
 	{
 		MemoryContext oldcontext;
-		MemoryContext listcontext;
 		text	   *package_name;
 		text	   *var_name;
 		Package    *package;
@@ -1498,9 +1482,7 @@ variable_select(PG_FUNCTION_ARGS)
 		entry->callback.func = variableStatEntryShutdown;
 		entry->callback.arg = entry;
 
-		listcontext = MemoryContextSwitchTo(TopTransactionContext);
-		variables_stats = lcons((void *) entry, variables_stats);
-		MemoryContextSwitchTo(listcontext);
+		dlist_push_head(&variables_stats, &entry->node);
 
 		MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
 										   &entry->callback);
@@ -1647,7 +1629,6 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		RecordVar  *record;
 		VariableStatEntry *entry;
 		MemoryContext oldcontext;
-		MemoryContext listcontext;
 
 		/* Checks */
 		CHECK_ARGS_FOR_NULL();
@@ -1702,9 +1683,7 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 		entry->callback.func = variableStatEntryShutdown;
 		entry->callback.arg = entry;
 
-		listcontext = MemoryContextSwitchTo(TopTransactionContext);
-		variables_stats = lcons((void *) entry, variables_stats);
-		MemoryContextSwitchTo(listcontext);
+		dlist_push_head(&variables_stats, &entry->node);
 
 		MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
 										   &entry->callback);
@@ -1736,6 +1715,8 @@ variable_select_by_values(PG_FUNCTION_ARGS)
 
 		item = (HashRecordEntry *) hash_search(record->rhash, &k,
 											   HASH_FIND, &found);
+		if (funcctx->user_fctx == NULL)
+			SRF_RETURN_DONE(funcctx);
 		if (found)
 		{
 			Assert(!HeapTupleHeaderHasExternal(
@@ -1920,7 +1901,7 @@ remove_package(PG_FUNCTION_ARGS)
 	 * for regular variables can be deleted in removePackageInternal().
 	 */
 	remove_variables_package(&variables_stats, package);
-	remove_packages_all(&packages_stats);
+	remove_packages_unmaterialized(&packages_stats);
 
 	removePackageInternal(package);
 
@@ -2204,23 +2185,33 @@ getMemoryTotalSpace(MemoryContext context, int level, Size *totalspace)
 }
 
 static Datum
-package_stats_tuple(Package *package, TupleDesc tupdesc)
+package_stats_tuple_values(const char *name, Size used_memory,
+						   TupleDesc tupdesc)
 {
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
 	HeapTuple	tuple;
+
+	values[0] = PointerGetDatum(cstring_to_text(name));
+	values[1] = Int64GetDatum(used_memory);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(DatumGetPointer(values[0]));
+	return HeapTupleGetDatum(tuple);
+}
+
+static Datum
+package_stats_tuple(Package *package, TupleDesc tupdesc)
+{
 	Size		regularSpace = 0,
 				transactSpace = 0;
 
-	values[0] = PointerGetDatum(cstring_to_text(GetName(package)));
 	if (package->hctxRegular)
 		getMemoryTotalSpace(package->hctxRegular, 0, &regularSpace);
 	if (package->hctxTransact)
 		getMemoryTotalSpace(package->hctxTransact, 0, &transactSpace);
-	values[1] = Int64GetDatum(regularSpace + transactSpace);
-	tuple = heap_form_tuple(tupdesc, values, nulls);
-	pfree(DatumGetPointer(values[0]));
-	return HeapTupleGetDatum(tuple);
+	return package_stats_tuple_values(GetName(package),
+									  regularSpace + transactSpace,
+									  tupdesc);
 }
 
 /* Get package memory statistics. */
@@ -2255,14 +2246,11 @@ get_packages_stats(PG_FUNCTION_ARGS)
 		 */
 		if (packagesHash)
 		{
-			MemoryContext listcontext;
-
 			check_open_seq_scans_limit();
 
 			rstat = (HASH_SEQ_STATUS *) palloc0(sizeof(HASH_SEQ_STATUS));
 			entry = palloc0(sizeof(PackageStatEntry));
 			entry->status = NULL;
-			entry->tupdesc = funcctx->tuple_desc;
 			entry->levels.level = GetCurrentTransactionNestLevel();
 #ifdef PGPRO_EE
 			entry->levels.atxlevel = getNestLevelATX();
@@ -2272,9 +2260,7 @@ get_packages_stats(PG_FUNCTION_ARGS)
 			entry->callback.func = packageStatEntryShutdown;
 			entry->callback.arg = entry;
 
-			listcontext = MemoryContextSwitchTo(TopTransactionContext);
-			packages_stats = lcons((void *) entry, packages_stats);
-			MemoryContextSwitchTo(listcontext);
+			dlist_push_head(&packages_stats, &entry->node);
 
 			MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
 											   &entry->callback);
@@ -2299,10 +2285,15 @@ get_packages_stats(PG_FUNCTION_ARGS)
 	rstat = entry->status;
 	if (!rstat)
 	{
+		PackageStatSnapshot *snap;
+
 		if (entry->next_row == entry->num_rows)
 			SRF_RETURN_DONE(funcctx);
+		snap = &entry->rows[entry->next_row++];
 		SRF_RETURN_NEXT(funcctx,
-						datumCopy(entry->rows[entry->next_row++], false, -1));
+						package_stats_tuple_values(snap->name,
+												   snap->used_memory,
+												   funcctx->tuple_desc));
 	}
 
 	package = (Package *) hash_seq_search(rstat);
@@ -2937,11 +2928,12 @@ removeState(TransObject *object, TransObjectType type, TransState *stateToDelete
 static void
 advance_package_stats_scans(Package *package)
 {
-	ListCell   *cell;
+	dlist_iter	iter;
 
-	foreach(cell, packages_stats)
+	dlist_foreach(iter, &packages_stats)
 	{
-		PackageStatEntry *entry = (PackageStatEntry *) lfirst(cell);
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
 		HASH_SEQ_STATUS probe;
 
 		if (!entry->active || !entry->status || !entry->status->curEntry)
@@ -3488,6 +3480,7 @@ addToChangesStackUpperLevel(TransObject *object, TransObjectType type)
 		Assert(active_changed_object->object == object);
 		co_new = active_changed_object;
 		active_changed_object = NULL;
+		dlist_delete(&co_new->node);
 	}
 	else
 		co_new = makeChangedObject(object, changesStackContext);
@@ -3718,7 +3711,7 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 	while (!dlist_is_empty(list))
 	{
 		ChangedObject *co = dlist_container(ChangedObject, node,
-											dlist_pop_head_node(list));
+											dlist_head_node(list));
 		TransObject *object = co->object;
 
 		active_changed_object = co;
@@ -3757,6 +3750,7 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 		}
 		if (active_changed_object != NULL)
 		{
+			dlist_delete(&active_changed_object->node);
 			pfree(active_changed_object);
 			active_changed_object = NULL;
 		}
@@ -3804,11 +3798,7 @@ processChanges(Action action, bool sub)
 	}
 	PG_CATCH();
 	{
-		if (active_changed_object != NULL)
-		{
-			pfree(active_changed_object);
-			active_changed_object = NULL;
-		}
+		active_changed_object = NULL;
 		resetVariablesCache();
 		if (!dlist_is_empty(bottom_list->changedVarsList) ||
 			!dlist_is_empty(bottom_list->changedPacksList))
@@ -4210,70 +4200,170 @@ pgvRestoreContext(void)
  * Record scans retain entry pointers, protected from deletion by the full-scan
  * guard. Stats scans retain result rows because package entries can disappear.
  */
+static bool
+has_child_hash_scan(HTAB *hash, Levels *levels)
+{
+	dlist_iter	iter;
+
+	dlist_foreach(iter, &variables_stats)
+	{
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
+
+		if (entry->active && entry->status && entry->hash == hash &&
+			VariableStatEntry_level_eq(entry, levels))
+			return true;
+	}
+	return false;
+}
+
 static void
 preserve_subtransaction_scans(Levels *levels)
 {
-	ListCell   *cell;
+	dlist_iter	iter;
+	bool		preserve_pkg_stats = false;
 
-	foreach(cell, variables_stats)
+	/*
+	 * Materialize every open scan on a hash table that has a child-level scan
+	 * at this savepoint so dynahash's table-keyed deregister_seq_scan() cannot
+	 * swap child and ancestor scan levels in seq_scan_tables[].
+	 *
+	 * Pass 1 allocates all snapshot buffers before any hash_seq_search() call
+	 * mutates entry->status or seq_scan_tables[]. Pass 2 drains the marked
+	 * scans without allocating or raising errors.
+	 */
+	dlist_foreach(iter, &variables_stats)
 	{
-		VariableStatEntry *entry = lfirst(cell);
-		HashRecordEntry *item;
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
 		MemoryContext context;
 
-		if (!VariableStatEntry_level_eq(entry, levels) || !entry->status)
+		entry->materialize = false;
+		if (!entry->active || !entry->status ||
+#ifdef PGPRO_EE
+			entry->levels.atxlevel != levels->atxlevel ||
+#endif
+			!has_child_hash_scan(entry->hash, levels))
 			continue;
 
+		if (entry->rows != NULL)
+		{
+			pfree(entry->rows);
+			entry->rows = NULL;
+		}
+		entry->num_rows = 0;
+		entry->next_row = 0;
 		context = GetMemoryChunkContext(entry);
 		entry->rows = MemoryContextAlloc(context,
 										mul_size(sizeof(HashRecordEntry *),
 												 hash_get_num_entries(entry->hash)));
-		while ((item = hash_seq_search(entry->status)) != NULL)
-		{
-			entry->rows[entry->num_rows++] = item;
-			CHECK_FOR_INTERRUPTS();
-		}
-		entry->status = NULL;
+		entry->materialize = true;
 	}
 
-	foreach(cell, packages_stats)
+	dlist_foreach(iter, &packages_stats)
 	{
-		PackageStatEntry *entry = lfirst(cell);
-		Package    *package;
-		MemoryContext oldcontext;
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
 
-		if (!PackageStatEntry_level_eq(entry, levels) || !entry->status)
+		entry->materialize = false;
+		if (entry->active && entry->status &&
+			PackageStatEntry_level_eq(entry, levels))
+			preserve_pkg_stats = true;
+	}
+
+	if (preserve_pkg_stats)
+	{
+		Size		snap_bytes = mul_size(sizeof(PackageStatSnapshot),
+										  hash_get_num_entries(packagesHash));
+
+		dlist_foreach(iter, &packages_stats)
+		{
+			PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+													  iter.cur);
+			MemoryContext context;
+
+			if (!entry->active || !entry->status
+#ifdef PGPRO_EE
+				|| entry->levels.atxlevel != levels->atxlevel
+#endif
+				)
+				continue;
+
+			if (entry->rows != NULL)
+			{
+				pfree(entry->rows);
+				entry->rows = NULL;
+			}
+			entry->num_rows = 0;
+			entry->next_row = 0;
+			context = GetMemoryChunkContext(entry);
+			entry->rows = MemoryContextAlloc(context, snap_bytes);
+			entry->materialize = true;
+		}
+	}
+
+	dlist_foreach(iter, &variables_stats)
+	{
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
+		HashRecordEntry *item;
+
+		if (!entry->materialize)
 			continue;
 
-		oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(entry));
-		entry->rows = palloc(mul_size(sizeof(Datum),
-									 hash_get_num_entries(packagesHash)));
-		while ((package = hash_seq_search(entry->status)) != NULL)
-		{
-			entry->rows[entry->num_rows++] = package_stats_tuple(package,
-																	 entry->tupdesc);
-			CHECK_FOR_INTERRUPTS();
-		}
+		while ((item = hash_seq_search(entry->status)) != NULL)
+			entry->rows[entry->num_rows++] = item;
 		entry->status = NULL;
-		MemoryContextSwitchTo(oldcontext);
+		entry->materialize = false;
+	}
+
+	if (preserve_pkg_stats)
+	{
+		dlist_foreach(iter, &packages_stats)
+		{
+			PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+													  iter.cur);
+			Package    *package;
+
+			if (!entry->materialize)
+				continue;
+
+			while ((package = hash_seq_search(entry->status)) != NULL)
+			{
+				Size		regularSpace = 0,
+							transactSpace = 0;
+				PackageStatSnapshot *snap = &entry->rows[entry->num_rows++];
+
+				strlcpy(snap->name, GetName(package), NAMEDATALEN);
+				if (package->hctxRegular)
+					getMemoryTotalSpace(package->hctxRegular, 0, &regularSpace);
+				if (package->hctxTransact)
+					getMemoryTotalSpace(package->hctxTransact, 0, &transactSpace);
+				snap->used_memory = regularSpace + transactSpace;
+			}
+			entry->status = NULL;
+			entry->materialize = false;
+		}
 	}
 }
 
 static void
 promote_subtransaction_scans(Levels *levels)
 {
-	ListCell   *cell;
+	dlist_iter	iter;
 
-	foreach(cell, variables_stats)
+	dlist_foreach(iter, &variables_stats)
 	{
-		VariableStatEntry *entry = lfirst(cell);
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
 
 		if (VariableStatEntry_level_eq(entry, levels))
 			entry->levels.level--;
 	}
-	foreach(cell, packages_stats)
+	dlist_foreach(iter, &packages_stats)
 	{
-		PackageStatEntry *entry = lfirst(cell);
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
 
 		if (PackageStatEntry_level_eq(entry, levels))
 			entry->levels.level--;
@@ -4478,7 +4568,7 @@ packageStatEntryShutdown(void *arg)
 static void
 freeStatsLists(void)
 {
-	ListCell   *cell;
+	dlist_mutable_iter iter;
 
 #ifdef PGPRO_EE
 	if (getNestLevelATX() > 0)
@@ -4489,10 +4579,12 @@ freeStatsLists(void)
 	}
 #endif
 
-	foreach(cell, variables_stats)
+	dlist_foreach_modify(iter, &variables_stats)
 	{
-		VariableStatEntry *entry = (VariableStatEntry *) lfirst(cell);
+		VariableStatEntry *entry = dlist_container(VariableStatEntry, node,
+												   iter.cur);
 
+		dlist_delete(iter.cur);
 		if (!entry->active)
 			continue;
 
@@ -4508,12 +4600,14 @@ freeStatsLists(void)
 		VariableStatEntry_deactivate(entry);
 	}
 
-	variables_stats = NIL;
+	dlist_init(&variables_stats);
 
-	foreach(cell, packages_stats)
+	dlist_foreach_modify(iter, &packages_stats)
 	{
-		PackageStatEntry *entry = (PackageStatEntry *) lfirst(cell);
+		PackageStatEntry *entry = dlist_container(PackageStatEntry, node,
+												  iter.cur);
 
+		dlist_delete(iter.cur);
 		if (!entry->active)
 			continue;
 
@@ -4529,7 +4623,7 @@ freeStatsLists(void)
 		PackageStatEntry_deactivate(entry);
 	}
 
-	packages_stats = NIL;
+	dlist_init(&packages_stats);
 }
 
 /*

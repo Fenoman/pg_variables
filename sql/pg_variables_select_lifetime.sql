@@ -424,3 +424,83 @@ SELECT 1 / 0;
 ROLLBACK TO cap_subabort;
 COMMIT;
 SELECT pgv_free();
+
+-- Closing an earlier scan must not swap dynahash slot levels for two active
+-- scans of the same collection across RELEASE SAVEPOINT (nor for pgv_stats()).
+SELECT pgv_insert('multi_scan', 'b', ROW(1), false);
+SELECT pgv_insert('multi_scan', 'b', ROW(2), false);
+SELECT pgv_insert('multi_scan', 'a', ROW(10), false);
+SELECT pgv_insert('multi_scan', 'a', ROW(20), false);
+SELECT pgv_set('multi_scan_2', 'x', 1, false);
+BEGIN;
+DECLARE ms_b CURSOR FOR SELECT pgv_select('multi_scan', 'b');
+MOVE 1 FROM ms_b;
+DECLARE ms_a_parent CURSOR FOR SELECT pgv_select('multi_scan', 'a');
+MOVE 1 FROM ms_a_parent;
+DECLARE ms_st_parent CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM ms_st_parent;
+SAVEPOINT ms_child;
+DECLARE ms_a_child CURSOR FOR SELECT pgv_select('multi_scan', 'a');
+MOVE 1 FROM ms_a_child;
+DECLARE ms_st_child CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM ms_st_child;
+MOVE ALL FROM ms_b;
+CLOSE ms_b;
+RELEASE SAVEPOINT ms_child;
+DO $$
+DECLARE
+    r record;
+    pkg text;
+    ca1 refcursor := 'ms_a_child';
+    ca2 refcursor := 'ms_a_parent';
+    cs1 refcursor := 'ms_st_child';
+    cs2 refcursor := 'ms_st_parent';
+    na1 integer := 0;
+    na2 integer := 0;
+    ns1 integer := 0;
+    ns2 integer := 0;
+BEGIN
+    LOOP FETCH ca1 INTO r; EXIT WHEN NOT FOUND; na1 := na1 + 1; END LOOP;
+    LOOP FETCH ca2 INTO r; EXIT WHEN NOT FOUND; na2 := na2 + 1; END LOOP;
+    LOOP FETCH cs1 INTO pkg; EXIT WHEN NOT FOUND; ns1 := ns1 + 1; END LOOP;
+    LOOP FETCH cs2 INTO pkg; EXIT WHEN NOT FOUND; ns2 := ns2 + 1; END LOOP;
+    IF na1 <> 1 OR na2 <> 1 OR ns1 <> 1 OR ns2 <> 1 THEN
+        RAISE EXCEPTION 'unexpected remaining rows: %, %, %, %', na1, na2, ns1, ns2;
+    END IF;
+END $$;
+CLOSE ms_a_child;
+CLOSE ms_a_parent;
+CLOSE ms_st_child;
+CLOSE ms_st_parent;
+COMMIT;
+SELECT pgv_free();
+
+-- Removing one package by name must not discard unread rows already captured
+-- in a stats cursor at RELEASE SAVEPOINT.
+SELECT pgv_set('stats_keep_1', 'v', 1, false);
+SELECT pgv_set('stats_keep_2', 'v', 2, false);
+SELECT pgv_set('stats_drop_3', 'v', 3, false);
+BEGIN;
+SAVEPOINT stats_snap;
+DECLARE stats_snap_cur CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM stats_snap_cur;
+RELEASE SAVEPOINT stats_snap;
+SELECT pgv_remove('stats_drop_3');
+DO $$
+DECLARE
+    rem integer := 0;
+    pkg text;
+    c refcursor := 'stats_snap_cur';
+BEGIN
+    LOOP
+        FETCH c INTO pkg;
+        EXIT WHEN NOT FOUND;
+        rem := rem + 1;
+    END LOOP;
+    IF rem <> 2 THEN
+        RAISE EXCEPTION 'pgv_remove discarded % materialized stats rows', 2 - rem;
+    END IF;
+END $$;
+CLOSE stats_snap_cur;
+COMMIT;
+SELECT pgv_free();

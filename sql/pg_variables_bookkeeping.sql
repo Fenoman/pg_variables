@@ -224,3 +224,22 @@ BEGIN
     END IF;
 END $$;
 SELECT pgv_free();
+
+-- Releasing a savepoint that replaces a transactional record state with two
+-- open parent scans must terminate those scans without List reallocations.
+BEGIN;
+SELECT pgv_insert('scan_release_alloc', 'r', ROW(1, 'a'::text), true);
+SELECT pgv_insert('scan_release_alloc', 'r', ROW(2, 'b'::text), true);
+DECLARE sra_c1 CURSOR FOR SELECT pgv_select('scan_release_alloc', 'r');
+DECLARE sra_c2 CURSOR FOR SELECT pgv_select('scan_release_alloc', 'r');
+MOVE 1 FROM sra_c1;
+MOVE 1 FROM sra_c2;
+SAVEPOINT sra_sp;
+SELECT pgv_insert('scan_release_alloc', 'r', ROW(3, 'c'::text), true);
+RELEASE SAVEPOINT sra_sp;
+FETCH ALL FROM sra_c1;
+FETCH ALL FROM sra_c2;
+CLOSE sra_c1;
+CLOSE sra_c2;
+COMMIT;
+SELECT pgv_free();
