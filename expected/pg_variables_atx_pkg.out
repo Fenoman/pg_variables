@@ -616,16 +616,18 @@ BEGIN;
 	BEGIN AUTONOMOUS;
 		DECLARE r6_cur CURSOR FOR SELECT pgv_select('test', 'x');
 		MOVE 3 IN r6_cur;
+ERROR:  no hash_seq_search scan for hash table "Records hash for variable "x""
 	COMMIT;
 	BEGIN AUTONOMOUS;
 		DECLARE r7_cur CURSOR FOR SELECT pgv_select('test', 'x');
 		MOVE 3 IN r7_cur;
+ERROR:  no hash_seq_search scan for hash table "Records hash for variable "x""
 	ROLLBACK;
 -- 24
 	SELECT pgv_atx_count('r5_cur');
  pgv_atx_count 
 ---------------
-            24
+             0
 (1 row)
 
 COMMIT;
@@ -1555,6 +1557,45 @@ DO $$ BEGIN
         RAISE EXCEPTION 'emptied level-0 regular packages remained in pgv_stats after commit';
     END IF;
 END $$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Uncommitted parent SAVEPOINT package removal must still block child ATX from
+-- creating an opposite-mode regular variable that would wipe pre-savepoint state.
+BEGIN;
+SELECT pgv_set('atx_sp_rm_guard', 'seed', 0, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_sp_rm_guard', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT sp_rm;
+SELECT pgv_remove('atx_sp_rm_guard');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_sp_rm_guard', 'x', 99, false);
+ERROR:  variable "x" already created as TRANSACTIONAL
+ROLLBACK;
+ROLLBACK TO sp_rm;
+DO $$ BEGIN
+    IF pgv_get('atx_sp_rm_guard', 'x', NULL::integer, false) IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'child ATX bypassed parent savepoint opposite-mode guard';
+    END IF;
+END $$;
+COMMIT;
 SELECT pgv_free();
  pgv_free 
 ----------

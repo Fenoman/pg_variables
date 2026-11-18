@@ -846,3 +846,22 @@ DO $$ BEGIN
     END IF;
 END $$;
 SELECT pgv_free();
+
+-- Uncommitted parent SAVEPOINT package removal must still block child ATX from
+-- creating an opposite-mode regular variable that would wipe pre-savepoint state.
+BEGIN;
+SELECT pgv_set('atx_sp_rm_guard', 'seed', 0, false);
+SELECT pgv_set('atx_sp_rm_guard', 'x', 10, true);
+SAVEPOINT sp_rm;
+SELECT pgv_remove('atx_sp_rm_guard');
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_sp_rm_guard', 'x', 99, false);
+ROLLBACK;
+ROLLBACK TO sp_rm;
+DO $$ BEGIN
+    IF pgv_get('atx_sp_rm_guard', 'x', NULL::integer, false) IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'child ATX bypassed parent savepoint opposite-mode guard';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();

@@ -1654,3 +1654,49 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Uncommitted parent SAVEPOINT package removal must still block child ATX from
+-- creating an opposite-mode regular variable that would wipe pre-savepoint state.
+BEGIN;
+SELECT pgv_set('atx_sp_rm_guard', 'seed', 0, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_sp_rm_guard', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT sp_rm;
+SELECT pgv_remove('atx_sp_rm_guard');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_sp_rm_guard', 'x', 99, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK;
+ROLLBACK TO sp_rm;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+DO $$ BEGIN
+    IF pgv_get('atx_sp_rm_guard', 'x', NULL::integer, false) IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'child ATX bypassed parent savepoint opposite-mode guard';
+    END IF;
+END $$;
+ERROR:  child ATX bypassed parent savepoint opposite-mode guard
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

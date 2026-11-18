@@ -2706,6 +2706,45 @@ hasAnyValidState(Variable *variable)
 	return false;
 }
 
+#ifdef PGPRO_EE
+static bool
+hasValidStateBeforeContextRemoval(Package *package, PackageContext *ctx,
+								  Variable *opp_var)
+{
+	PackState  *top_ps = (PackState *) ctx->state;
+	dlist_node *pnode;
+	dlist_iter	viter;
+	int			min_removal_level;
+
+	if (!top_ps->is_removed)
+		return hasAnyValidState(opp_var);
+
+	min_removal_level = top_ps->state.levels.level;
+	for (pnode = &ctx->state->node;
+		 dlist_has_next(&package->transObject.states, pnode);
+		 )
+	{
+		PackState  *ps;
+
+		pnode = dlist_next_node(&package->transObject.states, pnode);
+		ps = dlist_container(PackState, state.node, pnode);
+		if (ps->state.levels.atxlevel != top_ps->state.levels.atxlevel ||
+			!ps->is_removed)
+			break;
+		min_removal_level = ps->state.levels.level;
+	}
+
+	dlist_foreach(viter, &opp_var->transObject.states)
+	{
+		TransState *vs = dlist_container(TransState, node, viter.cur);
+
+		if (vs->is_valid && vs->levels.level < min_removal_level)
+			return true;
+	}
+	return false;
+}
+#endif
+
 /*
  * Create a variable or return a pointer to existing one.
  * Function is useful to set new value to variable and flag 'is_transactional'
@@ -2754,14 +2793,14 @@ createVariableInternal(Package *package, text *name, Oid typid, bool is_record,
 		{
 			if (ctx->child_committed_remove)
 				break;
-			if (ctx->varHashTransact != NULL &&
-				!((PackState *) ctx->state)->is_removed)
+			if (ctx->varHashTransact != NULL)
 			{
 				Variable   *opp_var;
 
 				opp_var = (Variable *) hash_search(ctx->varHashTransact, key,
 												   HASH_FIND, &found);
-				if (found && hasAnyValidState(opp_var))
+				if (found &&
+					hasValidStateBeforeContextRemoval(package, ctx, opp_var))
 				{
 					if (isPackageEmpty(package) &&
 						isObjectChangedInCurrentTrans(&package->transObject))
