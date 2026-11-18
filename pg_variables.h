@@ -86,6 +86,9 @@ typedef struct PackState
 	TransState	state;
 	unsigned long trans_var_num;	/* Number of valid transactional variables */
 	bool		is_removed;		/* Transactional contents were explicitly removed */
+#ifdef PGPRO_EE
+	bool		atx_removed;	/* Package removal committed in current ATX */
+#endif
 }			PackState;
 
 /* List node that stores one of the variable's states */
@@ -115,6 +118,7 @@ typedef struct PackageContext
 	HTAB	   *varHashTransact;
 	MemoryContext hctxTransact;
 	TransState *state;
+	TransState *atx_state;
 	struct PackageContext *next;
 }			PackageContext;
 #endif

@@ -1959,6 +1959,10 @@ removePackageInternal(Package *package)
 	GetActualState(package)->is_valid = false;
 	GetPackState(package)->trans_var_num = 0;
 	GetPackState(package)->is_removed = true;
+#ifdef PGPRO_EE
+	if (getNestLevelATX() > 0)
+		GetPackState(package)->atx_removed = true;
+#endif
 }
 
 /* Check if package has any valid variables */
@@ -3065,6 +3069,9 @@ createSavepoint(TransObject *object, TransObjectType type)
 														 sizeof(PackState));
 		((PackState *) newState)->trans_var_num = ((PackState *) prevState)->trans_var_num;
 		((PackState *) newState)->is_removed = ((PackState *) prevState)->is_removed;
+#ifdef PGPRO_EE
+		((PackState *) newState)->atx_removed = ((PackState *) prevState)->atx_removed;
+#endif
 	}
 	else
 	{
@@ -3240,6 +3247,7 @@ rollbackSavepoint(TransObject *object, TransObjectType type, bool sub)
 				packState->trans_var_num = 0;
 				packState->is_removed = false;
 #ifdef PGPRO_EE
+				packState->atx_removed = false;
 				/*
 				 * Package inside autonomous transaction should not be detected
 				 * as 'object has been changed in upper level' because in this
@@ -3293,6 +3301,7 @@ rollbackSavepoint(TransObject *object, TransObjectType type, bool sub)
 				packState->is_removed = prevState->is_removed;
 				packState->state.is_valid = false;
 #ifdef PGPRO_EE
+				packState->atx_removed = prevState->atx_removed;
 				packState->state.levels.atxlevel = getNestLevelATX();
 #endif
 				packState->state.levels.level = GetCurrentTransactionNestLevel() - 1;
@@ -3905,6 +3914,7 @@ pgvSaveContext(void)
 	if (packagesHash != NULL)
 	{
 		long		total_pkgs = hash_get_num_entries(packagesHash);
+		PackageContext *volatile pending_ctx = NULL;
 
 		if (total_pkgs > 0)
 			saved_pkgs = MemoryContextAlloc(CurTransactionContext,
@@ -3915,15 +3925,21 @@ pgvSaveContext(void)
 		{
 			while ((package = (Package *) hash_seq_search(&pstat)) != NULL)
 			{
-				PackageContext *context = MemoryContextAlloc(ModuleContext,
-															 sizeof(PackageContext));
+				PackState  *atx_state;
 
-				context->next = package->context;
-				context->hctxTransact = package->hctxTransact;
-				context->varHashTransact = package->varHashTransact;
-				context->state = GetActualState(&package->transObject);
-				package->context = context;
+				pending_ctx = MemoryContextAllocZero(ModuleContext,
+													 sizeof(PackageContext));
+				atx_state = MemoryContextAllocZero(ModuleContext,
+												   sizeof(PackState));
+
+				pending_ctx->next = package->context;
+				pending_ctx->hctxTransact = package->hctxTransact;
+				pending_ctx->varHashTransact = package->varHashTransact;
+				pending_ctx->state = GetActualState(&package->transObject);
+				pending_ctx->atx_state = &atx_state->state;
+				package->context = pending_ctx;
 				saved_pkgs[n_saved++] = package;
+				pending_ctx = NULL;
 			}
 		}
 		PG_CATCH();
@@ -3931,11 +3947,14 @@ pgvSaveContext(void)
 			long		i;
 
 			hash_seq_term(&pstat);
+			if (pending_ctx != NULL)
+				pfree(pending_ctx);
 			for (i = 0; i < n_saved; i++)
 			{
 				PackageContext *ctx = saved_pkgs[i]->context;
 
 				saved_pkgs[i]->context = ctx->next;
+				pfree(ctx->atx_state);
 				pfree(ctx);
 			}
 			PG_RE_THROW();
@@ -3944,7 +3963,18 @@ pgvSaveContext(void)
 
 		while (n_saved > 0)
 		{
+			PackState  *atx_state;
+
 			package = saved_pkgs[--n_saved];
+			atx_state = (PackState *) package->context->atx_state;
+			atx_state->state.is_valid = (numOfRegVars(package) > 0);
+			atx_state->state.levels.level = 0;
+			atx_state->state.levels.atxlevel = getNestLevelATX();
+			atx_state->trans_var_num = 0;
+			atx_state->is_removed = false;
+			atx_state->atx_removed = false;
+			dlist_push_head(&package->transObject.states, &atx_state->state.node);
+			package->context->atx_state = NULL;
 			package->hctxTransact = NULL;
 			package->varHashTransact = NULL;
 		}
@@ -3967,15 +3997,81 @@ pgvSaveContext(void)
 	active_atx_level = getNestLevelATX();
 }
 
+static void
+invalidateParentPackageInATXRestore(Package *package, int parent_atxlevel,
+									bool parent_has_stack)
+{
+	TransObject *object = &package->transObject;
+	dlist_iter	piter;
+
+	if (package->varHashTransact != NULL)
+	{
+		if (!parent_has_stack && package->context == NULL)
+		{
+			remove_variables_package(&variables_stats, package);
+			MemoryContextDelete(package->hctxTransact);
+			package->hctxTransact = NULL;
+			package->varHashTransact = NULL;
+		}
+		else
+		{
+			HASH_SEQ_STATUS vstat;
+			Variable   *variable;
+
+			hash_seq_init(&vstat, package->varHashTransact);
+			while ((variable = (Variable *) hash_seq_search(&vstat)) != NULL)
+			{
+				dlist_iter	viter;
+
+				remove_variables_variable(&variables_stats, variable);
+				dlist_foreach(viter, &variable->transObject.states)
+				{
+					VarState   *vs = dlist_container(VarState, state.node, viter.cur);
+
+					if (variable->is_record && vs->value.record.rhash)
+						remove_variables_hash(&variables_stats,
+											  vs->value.record.rhash);
+					freeValue(vs, variable->is_record);
+					if (variable->is_record)
+						memset(&vs->value.record, 0, sizeof(RecordVar));
+					else
+					{
+						vs->value.scalar.value = 0;
+						vs->value.scalar.is_null = true;
+					}
+					vs->state.is_valid = false;
+					vs->package_removal_level = 1;
+				}
+				variable->is_deleted = true;
+			}
+		}
+	}
+
+	dlist_foreach(piter, &object->states)
+	{
+		PackState  *ps = dlist_container(PackState, state.node, piter.cur);
+
+		if (ps->state.levels.atxlevel != parent_atxlevel)
+			break;
+		ps->trans_var_num = 0;
+		ps->is_removed = true;
+		ps->state.is_valid = (numOfRegVars(package) > 0);
+		if (parent_atxlevel > 0)
+			ps->atx_removed = true;
+	}
+}
+
 /*
  * Restore pg_variables's env pointer from pgv_context.
  */
 static void
-pgvRestoreContext()
+pgvRestoreContext(void)
 {
 	Package    *package;
 	HASH_SEQ_STATUS pstat;
 	PgvContextStruct *sus = pgv_context;
+	int			parent_atxlevel = sus ? sus->atxlevel : getNestLevelATX() - 1;
+	bool		parent_has_stack = (sus != NULL && sus->changesStack != NULL);
 
 	if (getNestLevelATX() > active_atx_level)
 		return;
@@ -4012,14 +4108,11 @@ pgvRestoreContext()
 				PackageContext *next = context->next;
 				TransObject *object = &package->transObject;
 				TransState *state;
-				bool		actual_valid_state;
+				bool		atx_removed = GetPackState(package)->atx_removed;
 
 				/* Restore transactional variables from context */
 				package->hctxTransact = context->hctxTransact;
 				package->varHashTransact = context->varHashTransact;
-
-				/* Save last actual state of package */
-				actual_valid_state = GetActualState(object)->is_valid;
 
 				/* Remove all package states, generated in ATX transaction */
 				while ((state = GetActualState(object)) != context->state)
@@ -4030,20 +4123,33 @@ pgvRestoreContext()
 							 "transaction state for package");
 				}
 
-				/*
-				 * Package could be removed in the autonomous transaction. So
-				 * need to mark it as invalid. Or removed package could be
-				 * re-created - so need to mark it as valid.
-				 */
-				if (actual_valid_state != GetActualState(object)->is_valid)
-					GetActualState(object)->is_valid = actual_valid_state;
-
-				/* Mark empty package as deleted. */
-				if (GetPackState(package)->trans_var_num + numOfRegVars(package) == 0)
-					GetActualState(object)->is_valid = false;
-
 				pfree(context);
 				package->context = next;
+
+				if (atx_removed)
+					invalidateParentPackageInATXRestore(package,
+														parent_atxlevel,
+														parent_has_stack);
+
+				GetActualState(object)->is_valid =
+					(GetPackState(package)->trans_var_num + numOfRegVars(package) > 0);
+
+				/*
+				 * A committed level-0 package emptied inside ATX has no parent
+				 * changesStack entry to release it later, so drop it now.
+				 */
+				if (!GetActualState(object)->is_valid &&
+					package->context == NULL &&
+					package->varHashRegular == NULL &&
+					package->varHashTransact == NULL &&
+					!parent_has_stack &&
+					!dlist_has_next(&object->states, dlist_head_node(&object->states)) &&
+					GetActualState(object)->levels.level == 0)
+				{
+					while (!dlist_is_empty(&object->states))
+						removeState(object, TRANS_PACKAGE, GetActualState(object));
+					removeObject(object, TRANS_PACKAGE);
+				}
 			}
 			else
 			{
@@ -4051,6 +4157,8 @@ pgvRestoreContext()
 				package->hctxTransact = NULL;
 				package->varHashTransact = NULL;
 				GetPackState(package)->trans_var_num = 0;
+				GetPackState(package)->is_removed = false;
+				GetPackState(package)->atx_removed = false;
 				GetActualState(package)->is_valid = numOfRegVars(package) > 0;
 
 				/*
@@ -4084,16 +4192,16 @@ pgvRestoreContext()
 		pfree(sus);
 	}
 	else
-	{
 		active_atx_level = getNestLevelATX() - 1;
-		if (packagesHash != NULL && !hash_get_num_entries(packagesHash))
-		{
-			remove_packages_all(&packages_stats);
-			MemoryContextDelete(ModuleContext);
-			packagesHash = NULL;
-			ModuleContext = NULL;
-			resetVariablesCache();
-		}
+
+	if (changesStack == NULL && pgv_context == NULL &&
+		packagesHash != NULL && !hash_get_num_entries(packagesHash))
+	{
+		remove_packages_all(&packages_stats);
+		MemoryContextDelete(ModuleContext);
+		packagesHash = NULL;
+		ModuleContext = NULL;
+		resetVariablesCache();
 	}
 }
 #endif							/* PGPRO_EE */

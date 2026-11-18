@@ -618,3 +618,122 @@ DROP FUNCTION pgv_atx_lazy_direct_d1(boolean, boolean);
 DROP FUNCTION pgv_atx_lazy_d1(boolean, boolean);
 DROP FUNCTION pgv_atx_lazy_d2(boolean);
 SELECT pgv_free();
+
+-- Parent transactional-only packages must stay invisible inside child ATX
+-- without leaking parent trans_var_num into child package state.
+BEGIN;
+SELECT pgv_set('atx_iso_pkg', 'parent_tx', 10, true);
+BEGIN AUTONOMOUS;
+DO $$ BEGIN
+    IF pgv_exists('atx_iso_pkg') THEN
+        RAISE EXCEPTION 'parent transactional-only package leaked into ATX';
+    END IF;
+    PERFORM pgv_set('atx_iso_pkg', 'child_tx', 20, true);
+    PERFORM pgv_remove('atx_iso_pkg', 'child_tx');
+    IF pgv_exists('atx_iso_pkg') THEN
+        RAISE EXCEPTION 'child package retained parent trans_var_num';
+    END IF;
+END $$;
+COMMIT;
+DO $$ BEGIN
+    IF pgv_get('atx_iso_pkg', 'parent_tx', NULL::integer) IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'child ATX isolation lost parent transactional value';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+-- Removing and recreating a package inside a committed child ATX must keep
+-- parent transactional values removed across parent reads and savepoint rollbacks.
+BEGIN;
+SELECT pgv_set('atx_self_recreate', 'old_tx', 10, true);
+SELECT pgv_set('atx_self_recreate', 'old_reg', 1, false);
+SAVEPOINT parent_sp;
+SELECT pgv_set('atx_self_recreate', 'old_tx', 20, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_self_recreate');
+SELECT pgv_set('atx_self_recreate', 'new_reg', 99, false);
+COMMIT;
+DO $$ BEGIN
+    IF pgv_exists('atx_self_recreate', 'old_tx') OR
+       pgv_get('atx_self_recreate', 'old_tx', NULL::integer, false) IS NOT NULL OR
+       pgv_exists('atx_self_recreate', 'old_reg') OR
+       pgv_get('atx_self_recreate', 'new_reg', NULL::integer, false) IS DISTINCT FROM 99 THEN
+        RAISE EXCEPTION 'committed ATX removal+recreation revived parent transactional value';
+    END IF;
+END $$;
+ROLLBACK TO parent_sp;
+DO $$ BEGIN
+    IF pgv_exists('atx_self_recreate', 'old_tx') OR
+       pgv_get('atx_self_recreate', 'new_reg', NULL::integer, false) IS DISTINCT FROM 99 THEN
+        RAISE EXCEPTION 'parent savepoint rollback undid committed ATX package removal';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+
+-- Committed ATX package removal without child recreation must still synchronize
+-- parent removal state and trans_var_num for subsequent parent operations.
+BEGIN;
+SELECT pgv_set('atx_parent_after_rm', 'old_tx', 10, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_free();
+COMMIT;
+SAVEPOINT sp_after_atx_rm;
+SELECT pgv_set('atx_parent_after_rm', 'reg', 55, false);
+ROLLBACK TO sp_after_atx_rm;
+DO $$ BEGIN
+    IF pgv_exists('atx_parent_after_rm', 'old_tx') OR
+       pgv_get('atx_parent_after_rm', 'reg', NULL::integer, false) IS DISTINCT FROM 55 THEN
+        RAISE EXCEPTION 'parent savepoint rollback after ATX removal revived old_tx';
+    END IF;
+END $$;
+SELECT pgv_remove('atx_parent_after_rm', 'reg');
+COMMIT;
+DO $$ BEGIN
+    IF pgv_exists('atx_parent_after_rm') OR
+       (SELECT count(*) FROM pgv_stats() WHERE package = 'atx_parent_after_rm') <> 0 THEN
+        RAISE EXCEPTION 'package stayed alive or in pgv_stats after ATX removal and regular cleanup';
+    END IF;
+END $$;
+SELECT pgv_free();
+
+-- A rolled-back savepoint around pgv_free() in a committed ATX, or removing only
+-- a regular variable in ATX, must preserve parent transactional values, while a
+-- committed level-0 regular package removed in ATX must disappear from pgv_stats().
+BEGIN;
+SELECT pgv_set('atx_keep_tx', 'old_tx', 42, true);
+SELECT pgv_set('atx_keep_tx', 'old_reg', 7, false);
+BEGIN AUTONOMOUS;
+SAVEPOINT sp_undo_free;
+SELECT pgv_free();
+ROLLBACK TO sp_undo_free;
+COMMIT;
+DO $$ BEGIN
+    IF pgv_get('atx_keep_tx', 'old_tx', NULL::integer, false) IS DISTINCT FROM 42 OR
+       pgv_exists('atx_keep_tx', 'old_reg') THEN
+        RAISE EXCEPTION 'rolled-back ATX pgv_free wiped parent transactional variable';
+    END IF;
+END $$;
+SELECT pgv_set('atx_keep_tx', 'old_reg2', 8, false);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_keep_tx', 'old_reg2');
+COMMIT;
+DO $$ BEGIN
+    IF pgv_get('atx_keep_tx', 'old_tx', NULL::integer, false) IS DISTINCT FROM 42 THEN
+        RAISE EXCEPTION 'removing only regular variable in ATX hid parent transactional variable';
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_set('atx_dead_reg_pkg', 'reg', 1, false);
+BEGIN;
+BEGIN AUTONOMOUS;
+SELECT pgv_free();
+COMMIT;
+COMMIT;
+DO $$ BEGIN
+    IF (SELECT count(*) FROM pgv_stats() WHERE package = 'atx_dead_reg_pkg') <> 0 THEN
+        RAISE EXCEPTION 'ATX pgv_free left dead level-0 package in pgv_stats';
+    END IF;
+END $$;
+SELECT pgv_free();
