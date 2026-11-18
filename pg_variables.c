@@ -4591,6 +4591,9 @@ materialize_other_level_variable_scans(HTAB *hash, Levels *levels)
 
 		entry->materialize = false;
 		if (!entry->active || !entry->status || entry->hash != hash ||
+#ifdef PGPRO_EE
+			entry->levels.atxlevel != levels->atxlevel ||
+#endif
 			VariableStatEntry_level_eq(entry, levels))
 			continue;
 
@@ -4648,6 +4651,9 @@ materialize_other_level_package_scans(Levels *levels)
 
 		entry->materialize = false;
 		if (!entry->active || !entry->status ||
+#ifdef PGPRO_EE
+			entry->levels.atxlevel != levels->atxlevel ||
+#endif
 			PackageStatEntry_level_eq(entry, levels))
 			continue;
 

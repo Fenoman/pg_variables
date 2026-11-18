@@ -865,3 +865,69 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SELECT pgv_free();
+
+-- Materializing a parent pgv_stats() cursor when a child ATX opens pgv_stats()
+-- must neither leak private child ATX packages nor lose parent transactional memory.
+SELECT pgv_insert('atx_ms', 'b', ROW(1), false);
+SELECT pgv_insert('atx_ms', 'b', ROW(2), false);
+SELECT pgv_insert('atx_ms', 'a', ROW(10), false);
+SELECT pgv_insert('atx_ms', 'a', ROW(20), false);
+CREATE TEMP TABLE atx_st_rows(pkg text, mem bigint);
+BEGIN;
+SELECT pgv_set('atx_parent_tx_mem', 'tx', repeat('x', 2048), true);
+DECLARE atx_ms_b CURSOR FOR SELECT pgv_select('atx_ms', 'b');
+MOVE 1 FROM atx_ms_b;
+DECLARE atx_ms_a_parent CURSOR FOR SELECT pgv_select('atx_ms', 'a');
+MOVE 1 FROM atx_ms_a_parent;
+DECLARE atx_st_parent CURSOR FOR SELECT (s).package AS pkg, (s).allocated_memory AS mem FROM pgv_stats() s;
+DO $$
+DECLARE
+    r record;
+    c refcursor := 'atx_st_parent';
+BEGIN
+    FETCH c INTO r;
+    INSERT INTO atx_st_rows VALUES (r.pkg, r.mem);
+END $$;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_child_priv_tx', 'tx', 1, true);
+DECLARE atx_ms_a_child CURSOR FOR SELECT pgv_select('atx_ms', 'a');
+MOVE 1 FROM atx_ms_a_child;
+DECLARE atx_st_child CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM atx_st_child;
+CLOSE atx_ms_a_child;
+CLOSE atx_st_child;
+COMMIT;
+MOVE ALL FROM atx_ms_b;
+CLOSE atx_ms_b;
+DO $$
+DECLARE
+    r record;
+    c refcursor := 'atx_st_parent';
+    ca refcursor := 'atx_ms_a_parent';
+    na integer := 0;
+BEGIN
+    LOOP
+        FETCH c INTO r;
+        EXIT WHEN NOT FOUND;
+        INSERT INTO atx_st_rows VALUES (r.pkg, r.mem);
+    END LOOP;
+    LOOP
+        FETCH ca INTO r;
+        EXIT WHEN NOT FOUND;
+        na := na + 1;
+    END LOOP;
+    IF na <> 1 THEN
+        RAISE EXCEPTION 'expected 1 remaining row in atx_ms_a_parent, got %', na;
+    END IF;
+    IF EXISTS (SELECT 1 FROM atx_st_rows WHERE pkg = 'atx_child_priv_tx') THEN
+        RAISE EXCEPTION 'child ATX private package leaked into parent pgv_stats cursor';
+    END IF;
+    IF (SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem') <= 0 THEN
+        RAISE EXCEPTION 'parent transactional package memory lost in materialized stats';
+    END IF;
+END $$;
+CLOSE atx_st_parent;
+CLOSE atx_ms_a_parent;
+COMMIT;
+DROP TABLE atx_st_rows;
+SELECT pgv_free();
