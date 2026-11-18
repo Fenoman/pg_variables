@@ -202,8 +202,10 @@ extern bool check_attributes(Variable *variable, HeapTupleHeader *rec, TupleDesc
 extern void coerce_unknown_first_record(TupleDesc *tupdesc, HeapTupleHeader * rec);
 extern void check_record_key(Variable *variable, Oid typid);
 
-extern void insert_record(Variable *variable, HeapTupleHeader tupleHeader);
-extern bool update_record(Variable *variable, HeapTupleHeader tupleHeader);
+extern void insert_record(Variable *variable, HeapTupleHeader tupleHeader,
+						  TupleDesc input_tupdesc);
+extern bool update_record(Variable *variable, HeapTupleHeader tupleHeader,
+						  TupleDesc input_tupdesc);
 extern bool delete_record(Variable *variable, Datum value, bool is_null);
 extern void check_record_delete_allowed(Variable *variable);
 extern void check_record_callback_mutation(Package *package, Variable *variable);

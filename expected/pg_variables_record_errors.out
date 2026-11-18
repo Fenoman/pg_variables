@@ -535,6 +535,17 @@ BEGIN
     PERFORM set_config('pgv_test.error', 'none', true);
     PERFORM set_config('pgv_test.reentry_source', 'none', true);
     PERFORM pgv_insert('del_scan_pkg', 'r', ROW('a'::pgv_error_key, 'one'::text), false);
+    PERFORM pgv_insert('del_scan_pkg', 'r', ROW('b'::pgv_error_key, 'two'::text), false);
+
+    -- Removing one of two colliding bucket entries must unlink only the matched
+    -- entry while leaving its bucket neighbor intact.
+    IF NOT pgv_delete('del_scan_pkg', 'r', 'b'::pgv_error_key) THEN
+        RAISE EXCEPTION 'expected pgv_delete to remove colliding key b';
+    END IF;
+    IF pgv_select('del_scan_pkg', 'r', 'b'::pgv_error_key) IS NOT NULL OR
+       pgv_select('del_scan_pkg', 'r', 'a'::pgv_error_key)::text IS DISTINCT FROM '(a,one)' THEN
+        RAISE EXCEPTION 'address-matched HASH_REMOVE unlinked the wrong colliding entry';
+    END IF;
 
     -- A full scan opened during HASH_FIND is caught by check_record_delete_allowed().
     SELECT last_value INTO base_calls FROM pgv_cmp_calls;
@@ -585,3 +596,46 @@ DROP FUNCTION pgv_error_cmp(pgv_error_key, pgv_error_key);
 DROP SEQUENCE pgv_hash_calls, pgv_cmp_calls;
 DROP FUNCTION pgv_reenter(text);
 DROP TYPE pgv_error_key;
+-- Short heap tuples carrying fast-default missing attributes (ALTER TABLE ADD
+-- COLUMN ... DEFAULT) must expand their missing defaults on insert and update.
+CREATE TEMP TABLE missing_default_src(id integer);
+INSERT INTO missing_default_src VALUES (1), (2), (3);
+ALTER TABLE missing_default_src ADD COLUMN n integer DEFAULT 7;
+CREATE FUNCTION pgv_capture_old_missing() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_ARGV[0] = 'insert' THEN
+        PERFORM pgv_insert('missing_def', 'r', OLD, false);
+    ELSE
+        PERFORM pgv_update('missing_def', 'r', OLD);
+    END IF;
+    RETURN OLD;
+END $$;
+CREATE TRIGGER tr_capture_old BEFORE DELETE ON missing_default_src
+    FOR EACH ROW EXECUTE PROCEDURE pgv_capture_old_missing('insert');
+DELETE FROM missing_default_src WHERE id IN (1, 2);
+DROP TRIGGER tr_capture_old ON missing_default_src;
+SELECT pgv_insert('missing_def', 'r', ROW(3, 99), false);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+CREATE TRIGGER tr_capture_old BEFORE DELETE ON missing_default_src
+    FOR EACH ROW EXECUTE PROCEDURE pgv_capture_old_missing('update');
+DELETE FROM missing_default_src WHERE id = 3;
+DO $$
+BEGIN
+    IF (SELECT array_agg(ROW(id, n)::text ORDER BY id)
+        FROM pgv_select('missing_def', 'r') AS t(id integer, n integer))
+       IS DISTINCT FROM ARRAY['(1,7)', '(2,7)', '(3,7)'] THEN
+        RAISE EXCEPTION 'fast-default missing attribute was lost on record copy';
+    END IF;
+END $$;
+DROP TABLE missing_default_src;
+DROP FUNCTION pgv_capture_old_missing();
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

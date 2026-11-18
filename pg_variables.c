@@ -1202,7 +1202,7 @@ variable_insert(PG_FUNCTION_ARGS)
 		tupType == record->last_checked_typeid &&
 		tupTypmod == record->last_checked_typmod)
 	{
-		insert_record(variable, rec);
+		insert_record(variable, rec, NULL);
 
 		PG_FREE_IF_COPY(package_name, 0);
 		PG_FREE_IF_COPY(var_name, 1);
@@ -1229,7 +1229,7 @@ variable_insert(PG_FUNCTION_ARGS)
 
 			init_record(record, tupdesc, variable);
 			variable->is_deleted = false;
-			insert_record(variable, rec);
+			insert_record(variable, rec, tupdesc);
 		}
 		PG_CATCH();
 		{
@@ -1267,7 +1267,7 @@ variable_insert(PG_FUNCTION_ARGS)
 		else
 			record->last_checked_typeid = InvalidOid;
 
-		insert_record(variable, rec);
+		insert_record(variable, rec, coerced ? NULL : tupdesc);
 	}
 
 	/* Release resources */
@@ -1328,10 +1328,9 @@ variable_update(PG_FUNCTION_ARGS)
 	 * Convert UNKNOWNOID to TEXTOID if needed
 	 * tupdesc may be changed
 	 */
-	(void) check_attributes(variable, &rec, tupdesc);
+	res = update_record(variable, rec,
+						check_attributes(variable, &rec, tupdesc) ? NULL : tupdesc);
 	ReleaseTupleDesc(tupdesc);
-
-	res = update_record(variable, rec);
 
 	/* Release resources */
 	PG_FREE_IF_COPY(package_name, 0);

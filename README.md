@@ -233,6 +233,10 @@ the same collection state is unfinished raises an error. Finish or close the
 scan before deleting records. A missing key still returns `false`, and keyed
 or array-key selectors do not impose this restriction.
 
+`pgv_insert()` requires at least one attribute and rejects whole-row values that
+still carry dropped table columns (`ALTER TABLE ... DROP COLUMN`). Construct a
+`ROW(...)` from the live columns when inserting from such tables.
+
 ### Miscellaneous functions
 
 Function | Returns | Description

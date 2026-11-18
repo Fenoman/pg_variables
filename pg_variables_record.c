@@ -475,7 +475,8 @@ check_record_key(Variable *variable, Oid typid)
 }
 
 static Datum
-copy_record_tuple(RecordVar *record, HeapTupleHeader tupleHeader)
+copy_record_tuple(RecordVar *record, HeapTupleHeader tupleHeader,
+				  TupleDesc input_tupdesc)
 {
 	HeapTupleData tuple;
 
@@ -487,6 +488,26 @@ copy_record_tuple(RecordVar *record, HeapTupleHeader tupleHeader)
 	ItemPointerSetInvalid(&tuple.t_self);
 	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = tupleHeader;
+
+	if (input_tupdesc != NULL &&
+		HeapTupleHeaderGetNatts(tupleHeader) < input_tupdesc->natts &&
+		input_tupdesc->constr != NULL &&
+		input_tupdesc->constr->missing != NULL)
+	{
+		int			natts = input_tupdesc->natts;
+		Datum	   *values = (Datum *) palloc(sizeof(Datum) * natts);
+		bool	   *isnull = (bool *) palloc(sizeof(bool) * natts);
+		HeapTuple	expanded;
+		Datum		result;
+
+		heap_deform_tuple(&tuple, input_tupdesc, values, isnull);
+		expanded = heap_form_tuple(record->tupdesc, values, isnull);
+		result = heap_copy_tuple_as_datum(expanded, record->tupdesc);
+		heap_freetuple(expanded);
+		pfree(values);
+		pfree(isnull);
+		return result;
+	}
 
 	return heap_copy_tuple_as_datum(&tuple, record->tupdesc);
 }
@@ -526,7 +547,8 @@ get_record_key(Datum tuple, TupleDesc tupdesc, bool *isnull)
  * Insert a new record. New record key should be unique in the variable.
  */
 void
-insert_record(Variable *variable, HeapTupleHeader tupleHeader)
+insert_record(Variable *variable, HeapTupleHeader tupleHeader,
+			  TupleDesc input_tupdesc)
 {
 	Datum		tuple;
 	Datum		value;
@@ -543,7 +565,7 @@ insert_record(Variable *variable, HeapTupleHeader tupleHeader)
 
 	oldcxt = MemoryContextSwitchTo(record->hctx);
 
-	tuple = copy_record_tuple(record, tupleHeader);
+	tuple = copy_record_tuple(record, tupleHeader, input_tupdesc);
 
 	/* Inserting a new record */
 	value = get_record_key(tuple, record->tupdesc, &isnull);
@@ -583,7 +605,8 @@ insert_record(Variable *variable, HeapTupleHeader tupleHeader)
  * Insert a record. New record key should be unique in the variable.
  */
 bool
-update_record(Variable *variable, HeapTupleHeader tupleHeader)
+update_record(Variable *variable, HeapTupleHeader tupleHeader,
+			  TupleDesc input_tupdesc)
 {
 	Datum		tuple;
 	Datum		value;
@@ -600,7 +623,7 @@ update_record(Variable *variable, HeapTupleHeader tupleHeader)
 
 	oldcxt = MemoryContextSwitchTo(record->hctx);
 
-	tuple = copy_record_tuple(record, tupleHeader);
+	tuple = copy_record_tuple(record, tupleHeader, input_tupdesc);
 
 	/* Update a record */
 	value = get_record_key(tuple, record->tupdesc, &isnull);
@@ -712,7 +735,8 @@ insert_record_copy(RecordVar *dest_record, Datum src_tuple, Variable *variable)
 
 	/* Inserting a new record into dest_record */
 	tuple = copy_record_tuple(dest_record,
-							  (HeapTupleHeader) DatumGetPointer(src_tuple));
+							  (HeapTupleHeader) DatumGetPointer(src_tuple),
+							  NULL);
 	value = get_record_key(tuple, dest_record->tupdesc, &isnull);
 
 	k.value = value;
