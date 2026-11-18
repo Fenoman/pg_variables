@@ -582,3 +582,39 @@ END $$;
 DROP TABLE missing_default_src;
 DROP FUNCTION pgv_capture_old_missing();
 SELECT pgv_free();
+
+-- Zero-attribute physical tuples after ALTER TABLE ADD COLUMN without DEFAULT
+-- must treat the omitted key attribute as NULL without out-of-bounds reads.
+CREATE TEMP TABLE zero_att_src();
+INSERT INTO zero_att_src DEFAULT VALUES;
+ALTER TABLE zero_att_src ADD COLUMN k text;
+CREATE FUNCTION pgv_cap_zero() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_ARGV[0] = 'insert' THEN
+        PERFORM pgv_insert('zero_def', 'r', OLD, false);
+    ELSE
+        PERFORM pgv_update('zero_def', 'r', OLD);
+    END IF;
+    RETURN OLD;
+END $$;
+CREATE TRIGGER tr_cap_zero BEFORE DELETE ON zero_att_src
+    FOR EACH ROW EXECUTE PROCEDURE pgv_cap_zero('insert');
+DELETE FROM zero_att_src;
+DROP TRIGGER tr_cap_zero ON zero_att_src;
+INSERT INTO zero_att_src DEFAULT VALUES;
+DROP TABLE zero_att_src;
+CREATE TEMP TABLE zero_att_src();
+INSERT INTO zero_att_src DEFAULT VALUES;
+ALTER TABLE zero_att_src ADD COLUMN k text;
+CREATE TRIGGER tr_cap_zero BEFORE DELETE ON zero_att_src
+    FOR EACH ROW EXECUTE PROCEDURE pgv_cap_zero('update');
+DELETE FROM zero_att_src;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pgv_select('zero_def', 'r') AS t(k text) WHERE k IS NULL) <> 1 THEN
+        RAISE EXCEPTION 'zero-attribute short tuple did not decode NULL key';
+    END IF;
+END $$;
+DROP TABLE zero_att_src;
+DROP FUNCTION pgv_cap_zero();
+SELECT pgv_free();
