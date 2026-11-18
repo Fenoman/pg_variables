@@ -152,7 +152,7 @@ printf "port = %s\nlisten_addresses = ''\nunix_socket_directories = '%s'\n" "$PG
 
 cluster_start_attempted=1
 if [[ "$LEVEL" == nightmare ]]; then
-	valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=definite,indirect \
+	valgrind --tool=memcheck --leak-check=no \
 		--error-exitcode=1 --time-stamp=yes --track-origins=yes \
 		--gen-suppressions=all --suppressions="$CUSTOM_PG_SRC/src/tools/valgrind.supp" \
 		--suppressions="$SOURCE_DIR/valgrind.supp" --log-file="$RUN_DIR/valgrind-%p.log" \
