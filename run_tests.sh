@@ -85,6 +85,9 @@ finish()
 	for log in regression.out regression.diffs; do
 		if [[ -f "$SOURCE_DIR/$log" ]]; then cp "$SOURCE_DIR/$log" "$RUN_DIR/" || rc=1; fi
 	done
+	if [[ "$rc" != 0 && -f "$SOURCE_DIR/regression.diffs" ]]; then
+		cat "$SOURCE_DIR/regression.diffs"
+	fi
 	if [[ -d "$SOURCE_DIR/results" ]]; then
 		mkdir -p "$RUN_DIR/regression-results" || rc=1
 		for log in "$SOURCE_DIR"/results/*.out; do
@@ -135,7 +138,7 @@ if [[ "$LEVEL" != standard ]]; then
 fi
 run_logged build make USE_PGXS=1 PG_CPPFLAGS=-coverage SHLIB_LINK=-coverage
 run_logged install make USE_PGXS=1 PG_CPPFLAGS=-coverage SHLIB_LINK=-coverage install
-run_logged initdb initdb -D "$PGDATA"
+run_logged initdb initdb --locale=C -D "$PGDATA"
 
 export PGPORT="${PGPORT:-55435}"
 socket_dir="$(mktemp -d "${TMPDIR:-/tmp}/pgv-socket.XXXXXX")"

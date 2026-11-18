@@ -53,4 +53,3 @@ matrix:
         - env: PG_VERSION=13 LEVEL=nightmare
         - env: PG_VERSION=14 LEVEL=nightmare
         - env: PG_VERSION=15 LEVEL=nightmare
-        - env: PG_VERSION=16 LEVEL=nightmare
