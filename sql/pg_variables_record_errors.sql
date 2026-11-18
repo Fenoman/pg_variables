@@ -41,6 +41,29 @@ BEGIN
 END
 $$;
 DROP TABLE dropped_record_key;
+CREATE TEMP TABLE dropped_record_attr(id integer, dead integer, payload text);
+ALTER TABLE dropped_record_attr DROP COLUMN dead;
+INSERT INTO dropped_record_attr VALUES (1, 'alive');
+DO $$
+DECLARE
+    transactional boolean;
+    rejected boolean;
+BEGIN
+    FOREACH transactional IN ARRAY ARRAY[false, true] LOOP
+        rejected := false;
+        BEGIN
+            PERFORM pgv_insert('record_init', 'r_attr', t, transactional)
+            FROM dropped_record_attr t;
+        EXCEPTION WHEN invalid_parameter_value THEN
+            rejected := true;
+        END;
+        IF NOT rejected OR pgv_exists('record_init', 'r_attr') THEN
+            RAISE EXCEPTION 'dropped non-key attribute was accepted or left a variable visible';
+        END IF;
+    END LOOP;
+END
+$$;
+DROP TABLE dropped_record_attr;
 SELECT pgv_free();
 
 -- Failed hash and comparison calls release unpublished tuples.
@@ -68,6 +91,16 @@ BEGIN
         END IF;
       WHEN 'same_pkg_reg' THEN
         PERFORM pgv_set('recreate_cb', 'reg', 1, false);
+      WHEN 'open_scan_first' THEN
+        IF currval('pgv_cmp_calls') = coalesce(nullif(current_setting('pgv_test.cmp_base', true), ''), '0')::bigint + 1 THEN
+            EXECUTE 'DECLARE pgv_del_scan_c1 CURSOR FOR SELECT pgv_select(''del_scan_pkg'', ''r'')';
+            EXECUTE 'MOVE 1 IN pgv_del_scan_c1';
+        END IF;
+      WHEN 'open_scan_second' THEN
+        IF currval('pgv_cmp_calls') >= coalesce(nullif(current_setting('pgv_test.cmp_base', true), ''), '0')::bigint + 2 THEN
+            EXECUTE 'DECLARE pgv_del_scan_c2 CURSOR FOR SELECT pgv_select(''del_scan_pkg'', ''r'')';
+            EXECUTE 'MOVE 1 IN pgv_del_scan_c2';
+        END IF;
       ELSE NULL;
     END CASE;
 END $$;
@@ -91,6 +124,10 @@ BEGIN
     PERFORM pgv_reenter('compare');
     IF current_setting('pgv_test.error', true) = 'compare' THEN
         RAISE EXCEPTION USING ERRCODE = 'PZ062', MESSAGE = 'controlled comparison failure';
+    END IF;
+    IF current_setting('pgv_test.cmp_flip', true) = 'after_first' AND
+       currval('pgv_cmp_calls') > coalesce(nullif(current_setting('pgv_test.cmp_base', true), ''), '0')::bigint + 1 THEN
+        RETURN 1;
     END IF;
     RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END;
 END
@@ -406,6 +443,91 @@ DO $$ BEGIN
     END IF;
 END $$;
 SELECT pgv_free();
+-- A failure inside the first insert_record() call must also clean up the newly
+-- created variable and package rather than leaving an empty typed collection.
+DO $$
+DECLARE
+    transactional boolean;
+    rejected boolean;
+BEGIN
+    FOREACH transactional IN ARRAY ARRAY[false, true] LOOP
+        PERFORM set_config('pgv_test.error', 'hash', true);
+        rejected := false;
+        BEGIN
+            PERFORM pgv_insert('first_insert_err', 'r',
+                               ROW('a'::pgv_error_key, 'payload'::text),
+                               transactional);
+        EXCEPTION WHEN SQLSTATE 'PZ061' THEN
+            rejected := true;
+        END;
+        PERFORM set_config('pgv_test.error', 'none', true);
+        IF NOT rejected OR
+           pgv_exists('first_insert_err', 'r') OR
+           pgv_exists('first_insert_err') THEN
+            RAISE EXCEPTION 'failed first insert left an empty collection visible (transactional=%)',
+                            transactional;
+        END IF;
+        PERFORM pgv_insert('first_insert_err', 'r', ROW(42, 'retyped'::text),
+                           transactional);
+        IF pgv_select('first_insert_err', 'r', 42)::text IS DISTINCT FROM '(42,retyped)' THEN
+            RAISE EXCEPTION 'failed first insert locked in a stale tuple descriptor';
+        END IF;
+        PERFORM pgv_free();
+    END LOOP;
+END $$;
+-- pgv_delete checks open scans after HASH_FIND and removes the matched bucket
+-- entry without calling the user comparison function a second time.
+DO $$
+DECLARE
+    base_calls bigint;
+    after_calls bigint;
+    rejected boolean := false;
+    c2_open boolean;
+BEGIN
+    PERFORM set_config('pgv_test.error', 'none', true);
+    PERFORM set_config('pgv_test.reentry_source', 'none', true);
+    PERFORM pgv_insert('del_scan_pkg', 'r', ROW('a'::pgv_error_key, 'one'::text), false);
+
+    -- A full scan opened during HASH_FIND is caught by check_record_delete_allowed().
+    SELECT last_value INTO base_calls FROM pgv_cmp_calls;
+    PERFORM set_config('pgv_test.cmp_base', base_calls::text, true);
+    PERFORM set_config('pgv_test.reentry_source', 'compare', true);
+    PERFORM set_config('pgv_test.reentry_action', 'open_scan_first', true);
+    BEGIN
+        PERFORM pgv_delete('del_scan_pkg', 'r', 'a'::pgv_error_key);
+    EXCEPTION WHEN object_in_use THEN
+        rejected := true;
+    END;
+    PERFORM set_config('pgv_test.reentry_source', 'none', true);
+    IF NOT rejected OR
+       pgv_select('del_scan_pkg', 'r', 'a'::pgv_error_key)::text IS DISTINCT FROM '(a,one)' THEN
+        RAISE EXCEPTION 'scan opened during HASH_FIND did not abort deletion cleanly';
+    END IF;
+
+    -- HASH_REMOVE must not invoke the comparison callback a second time, so a
+    -- second-call scan hook never fires and an unstable comparator cannot leave
+    -- a freed tuple inside a live bucket entry.
+    SELECT last_value INTO base_calls FROM pgv_cmp_calls;
+    PERFORM set_config('pgv_test.cmp_base', base_calls::text, true);
+    PERFORM set_config('pgv_test.reentry_source', 'compare', true);
+    PERFORM set_config('pgv_test.reentry_action', 'open_scan_second', true);
+    PERFORM set_config('pgv_test.cmp_flip', 'after_first', true);
+    IF NOT pgv_delete('del_scan_pkg', 'r', 'a'::pgv_error_key) THEN
+        RAISE EXCEPTION 'expected pgv_delete to remove key a';
+    END IF;
+    SELECT last_value INTO after_calls FROM pgv_cmp_calls;
+    SELECT EXISTS (SELECT 1 FROM pg_cursors WHERE name = 'pgv_del_scan_c2') INTO c2_open;
+    PERFORM set_config('pgv_test.reentry_source', 'none', true);
+    PERFORM set_config('pgv_test.cmp_flip', 'none', true);
+    IF c2_open OR after_calls - base_calls <> 1 THEN
+        RAISE EXCEPTION 'HASH_REMOVE invoked user comparison a second time (calls=%, cursor=%)',
+                        after_calls - base_calls, c2_open;
+    END IF;
+    IF (SELECT count(*) FROM pgv_select('del_scan_pkg', 'r') AS t(k pgv_error_key, v text)) <> 0 THEN
+        RAISE EXCEPTION 'deleted entry remained in collection';
+    END IF;
+    PERFORM pgv_free();
+END $$;
 DROP OPERATOR CLASS pgv_error_hash_ops USING hash;
 DROP OPERATOR CLASS pgv_error_cmp_ops USING btree;
 DROP OPERATOR FAMILY pgv_error_hash_ops USING hash;

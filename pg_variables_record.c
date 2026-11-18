@@ -42,6 +42,7 @@ typedef struct RecordCallback
 } RecordCallback;
 
 static RecordCallback *record_callbacks;
+static const HashRecordKey *exact_remove_key;
 
 /* Support functions may read state, but cannot mutate an active collection. */
 void
@@ -133,11 +134,13 @@ record_hash(const void *key, Size keysize)
 	{
 		h = FunctionCall1Coll(&k.record->hash_proc, DEFAULT_COLLATION_OID, k.value);
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		record_callbacks = callback.previous;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	record_callbacks = callback.previous;
 	return DatumGetUInt32(h);
 }
 
@@ -147,10 +150,16 @@ record_hash(const void *key, Size keysize)
 static int
 record_match(const void *key1, const void *key2, Size keysize)
 {
-	HashRecordKey k1 = *((const HashRecordKey *) key1);
-	HashRecordKey k2 = *((const HashRecordKey *) key2);
+	HashRecordKey k1;
+	HashRecordKey k2;
 	Datum		c;
 	RecordCallback callback;
+
+	if (unlikely(exact_remove_key != NULL && key2 == exact_remove_key))
+		return (key1 == exact_remove_key) ? 0 : 1;
+
+	k1 = *((const HashRecordKey *) key1);
+	k2 = *((const HashRecordKey *) key2);
 
 	if (k1.is_null)
 	{
@@ -170,11 +179,13 @@ record_match(const void *key1, const void *key2, Size keysize)
 		c = FunctionCall2Coll(&k1.record->cmp_proc, DEFAULT_COLLATION_OID,
 							  k1.value, k2.value);
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		record_callbacks = callback.previous;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	record_callbacks = callback.previous;
 	return DatumGetInt32(c);
 }
 
@@ -187,6 +198,7 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 				topctx;
 	TypeCacheEntry *typentry;
 	Oid			keyid;
+	int			i;
 
 	Assert(variable->typid == RECORDOID);
 	record->variable = variable;
@@ -195,10 +207,15 @@ init_record(RecordVar *record, TupleDesc tupdesc, Variable *variable)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("record must have at least one attribute")));
-	if (GetTupleDescAttr(tupdesc, 0)->attisdropped)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("record key attribute must not be dropped")));
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		if (GetTupleDescAttr(tupdesc, i)->attisdropped)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 (i == 0 ?
+					  errmsg("record key attribute must not be dropped") :
+					  errmsg("record attribute %d must not be dropped", i + 1))));
+	}
 
 	/* First get hash and match functions for key type. */
 	keyid = GetTupleDescAttr(tupdesc, 0)->atttypid;
@@ -652,11 +669,26 @@ delete_record(Variable *variable, Datum value, bool is_null)
 
 	check_record_delete_allowed(variable);
 
-	/* HASH_REMOVE returns a dangling entry, so save its tuple beforehand. */
+	/*
+	 * Match the located bucket entry by address so HASH_REMOVE runs no second
+	 * comparison callback after check_record_delete_allowed().
+	 */
 	tuple = item->tuple;
-	(void) hash_search_with_hash_value(record->rhash, &k, hashvalue,
-									 HASH_REMOVE, &found);
-	Assert(found);
+	exact_remove_key = &item->key;
+	PG_TRY();
+	{
+		(void) hash_search_with_hash_value(record->rhash, &item->key,
+										 hashvalue, HASH_REMOVE, &found);
+	}
+	PG_CATCH();
+	{
+		exact_remove_key = NULL;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	exact_remove_key = NULL;
+	if (!found)
+		elog(ERROR, "hash table corrupted during record deletion");
 	pfree(DatumGetPointer(tuple));
 
 	return true;

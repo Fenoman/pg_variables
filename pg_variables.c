@@ -1230,6 +1230,7 @@ variable_insert(PG_FUNCTION_ARGS)
 
 			init_record(record, tupdesc, variable);
 			variable->is_deleted = false;
+			insert_record(variable, rec);
 		}
 		PG_CATCH();
 		{
@@ -1266,9 +1267,9 @@ variable_insert(PG_FUNCTION_ARGS)
 		}
 		else
 			record->last_checked_typeid = InvalidOid;
-	}
 
-	insert_record(variable, rec);
+		insert_record(variable, rec);
+	}
 
 	/* Release resources */
 	if (tupdesc)
