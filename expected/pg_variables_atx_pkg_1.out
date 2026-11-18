@@ -1425,17 +1425,14 @@ SELECT pgv_set('atx_same_name', 'old_txt', 456, true);
 (1 row)
 
 DO $$ BEGIN
-    IF pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
-       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
+    IF pgv_get('atx_same_name', 'x', NULL::integer, false) IS DISTINCT FROM 3 OR
+       pgv_get('atx_same_name', 'old_txt', NULL::integer, false) IS DISTINCT FROM 456 OR
        (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1 THEN
         RAISE EXCEPTION 'parent same-name reuse after ATX package removal failed';
     END IF;
 END $$;
-ERROR:  unrecognized variable "old_txt"
-CONTEXT:  PL/pgSQL expression "pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
-       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
-       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1"
-PL/pgSQL function inline_code_block line 2 at IF
+ERROR:  parent same-name reuse after ATX package removal failed
+CONTEXT:  PL/pgSQL function inline_code_block line 5 at RAISE
 COMMIT;
 WARNING:  there is no transaction in progress
 SELECT pgv_free();
@@ -1492,17 +1489,14 @@ SELECT pgv_set('atx_opp_guard', 'x', 77, false);
 ROLLBACK;
 WARNING:  there is no transaction in progress
 DO $$ BEGIN
-    IF pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
-       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
+    IF pgv_get('atx_opp_guard', 'x', NULL::integer, false) IS DISTINCT FROM 77 OR
+       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer, false) IS DISTINCT FROM 20 OR
        (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1 THEN
         RAISE EXCEPTION 'aborted ATX left duplicate name or lost non-colliding transactional var';
     END IF;
 END $$;
-ERROR:  unrecognized variable "keep_tx"
-CONTEXT:  PL/pgSQL expression "pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
-       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
-       (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1"
-PL/pgSQL function inline_code_block line 2 at IF
+ERROR:  aborted ATX left duplicate name or lost non-colliding transactional var
+CONTEXT:  PL/pgSQL function inline_code_block line 5 at RAISE
 COMMIT;
 WARNING:  there is no transaction in progress
 SELECT pgv_free();

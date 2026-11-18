@@ -752,8 +752,8 @@ SELECT pgv_get('atx_same_name', 'x', NULL::integer) AS x_from_child;
 SELECT pgv_set('atx_same_name', 'x', 3, false);
 SELECT pgv_set('atx_same_name', 'old_txt', 456, true);
 DO $$ BEGIN
-    IF pgv_get('atx_same_name', 'x', NULL::integer) IS DISTINCT FROM 3 OR
-       pgv_get('atx_same_name', 'old_txt', NULL::integer) IS DISTINCT FROM 456 OR
+    IF pgv_get('atx_same_name', 'x', NULL::integer, false) IS DISTINCT FROM 3 OR
+       pgv_get('atx_same_name', 'old_txt', NULL::integer, false) IS DISTINCT FROM 456 OR
        (SELECT count(*) FROM pgv_list() WHERE package = 'atx_same_name' AND name = 'x') <> 1 THEN
         RAISE EXCEPTION 'parent same-name reuse after ATX package removal failed';
     END IF;
@@ -776,8 +776,8 @@ SELECT pgv_remove('atx_opp_guard');
 SELECT pgv_set('atx_opp_guard', 'x', 77, false);
 ROLLBACK;
 DO $$ BEGIN
-    IF pgv_get('atx_opp_guard', 'x', NULL::integer) IS DISTINCT FROM 77 OR
-       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer) IS DISTINCT FROM 20 OR
+    IF pgv_get('atx_opp_guard', 'x', NULL::integer, false) IS DISTINCT FROM 77 OR
+       pgv_get('atx_opp_guard', 'keep_tx', NULL::integer, false) IS DISTINCT FROM 20 OR
        (SELECT count(*) FROM pgv_list() WHERE package = 'atx_opp_guard' AND name = 'x') <> 1 THEN
         RAISE EXCEPTION 'aborted ATX left duplicate name or lost non-colliding transactional var';
     END IF;

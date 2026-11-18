@@ -25,6 +25,7 @@ RUN_DIR="$(mktemp -d "${TEST_RESULTS_DIR:-${TMPDIR:-/tmp}}/pgv_${LEVEL}.XXXXXX")
 RUN_DIR="$(cd "$RUN_DIR" && pwd)"
 echo "Test logs: $RUN_DIR"
 cluster_start_attempted=0
+installcheck_started=0
 server_pid=""
 socket_dir=""
 
@@ -82,17 +83,19 @@ finish()
 			fi
 		done
 	fi
-	for log in regression.out regression.diffs; do
-		if [[ -f "$SOURCE_DIR/$log" ]]; then cp "$SOURCE_DIR/$log" "$RUN_DIR/" || rc=1; fi
-	done
-	if [[ "$rc" != 0 && -f "$SOURCE_DIR/regression.diffs" ]]; then
-		cat "$SOURCE_DIR/regression.diffs"
-	fi
-	if [[ -d "$SOURCE_DIR/results" ]]; then
-		mkdir -p "$RUN_DIR/regression-results" || rc=1
-		for log in "$SOURCE_DIR"/results/*.out; do
-			if [[ -f "$log" ]]; then cp "$log" "$RUN_DIR/regression-results/" || rc=1; fi
+	if [[ "$installcheck_started" == 1 ]]; then
+		for log in regression.out regression.diffs; do
+			if [[ -f "$SOURCE_DIR/$log" ]]; then cp "$SOURCE_DIR/$log" "$RUN_DIR/" || rc=1; fi
 		done
+		if [[ "$rc" != 0 && -f "$SOURCE_DIR/regression.diffs" ]]; then
+			cat "$SOURCE_DIR/regression.diffs"
+		fi
+		if [[ -d "$SOURCE_DIR/results" ]]; then
+			mkdir -p "$RUN_DIR/regression-results" || rc=1
+			for log in "$SOURCE_DIR"/results/*.out; do
+				if [[ -f "$log" ]]; then cp "$log" "$RUN_DIR/regression-results/" || rc=1; fi
+			done
+		fi
 	fi
 	printf '%s\n' "$rc" > "$RUN_DIR/exit-code" || rc=1
 	echo "Test exit code: $rc. Logs: $RUN_DIR"
@@ -138,7 +141,7 @@ if [[ "$LEVEL" != standard ]]; then
 fi
 run_logged build make USE_PGXS=1 PG_CPPFLAGS=-coverage SHLIB_LINK=-coverage
 run_logged install make USE_PGXS=1 PG_CPPFLAGS=-coverage SHLIB_LINK=-coverage install
-run_logged initdb initdb --locale=C -D "$PGDATA"
+run_logged initdb initdb --locale=C --encoding=UTF8 -D "$PGDATA"
 
 export PGPORT="${PGPORT:-55435}"
 socket_dir="$(mktemp -d "${TMPDIR:-/tmp}/pgv-socket.XXXXXX")"
@@ -167,5 +170,7 @@ else
 fi
 
 export PG_REGRESS_DIFF_OPTS="-w -U3"
+rm -f "$SOURCE_DIR/regression.diffs" "$SOURCE_DIR/regression.out"
+installcheck_started=1
 run_logged installcheck make USE_PGXS=1 installcheck
 run_logged gcov gcov pg_variables.c pg_variables_record.c
