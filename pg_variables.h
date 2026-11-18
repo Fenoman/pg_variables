@@ -187,7 +187,6 @@ typedef struct ChangesStackNode
 	dlist_node	node;
 	dlist_head *changedVarsList;
 	dlist_head *changedPacksList;
-	MemoryContext ctx;
 	int			level;
 }			ChangesStackNode;
 

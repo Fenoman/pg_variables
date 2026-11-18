@@ -751,7 +751,6 @@ static void packageStatEntryShutdown(void *arg);
 #define PGV_MCXT_MAIN		"pg_variables: main memory context"
 #define PGV_MCXT_VARS		"pg_variables: variables hash"
 #define PGV_MCXT_STACK		"pg_variables: changesStack"
-#define PGV_MCXT_STACK_NODE	"pg_variables: changesStackNode"
 
 
 static inline bool
@@ -3466,19 +3465,8 @@ releaseSavepoint(TransObject *object, TransObjectType type, bool sub)
 #endif
 }
 
-static dlist_head prealloc_upper_objects = DLIST_STATIC_INIT(prealloc_upper_objects);
-
-static void
-freePreallocUpperObjects(void)
-{
-	while (!dlist_is_empty(&prealloc_upper_objects))
-	{
-		ChangedObject *co = dlist_container(ChangedObject, node,
-											dlist_pop_head_node(&prealloc_upper_objects));
-
-		pfree(co);
-	}
-}
+/* Node currently being processed by applyAction(), spliced on promotion. */
+static ChangedObject *active_changed_object = NULL;
 
 static void
 addToChangesStackUpperLevel(TransObject *object, TransObjectType type)
@@ -3486,19 +3474,15 @@ addToChangesStackUpperLevel(TransObject *object, TransObjectType type)
 	ChangedObject *co_new;
 	ChangesStackNode *csn;
 
-	/*
-	 * Impossible to push in upper list existing node because it was created
-	 * in another context
-	 */
 	csn = dlist_head_element(ChangesStackNode, node, changesStack);
-	if (!dlist_is_empty(&prealloc_upper_objects))
+	if (likely(active_changed_object != NULL))
 	{
-		co_new = dlist_container(ChangedObject, node,
-								 dlist_pop_head_node(&prealloc_upper_objects));
-		co_new->object = object;
+		Assert(active_changed_object->object == object);
+		co_new = active_changed_object;
+		active_changed_object = NULL;
 	}
 	else
-		co_new = makeChangedObject(object, csn->ctx);
+		co_new = makeChangedObject(object, changesStackContext);
 	dlist_push_head(type == TRANS_PACKAGE ? csn->changedPacksList :
 					csn->changedVarsList,
 					&co_new->node);
@@ -3600,18 +3584,12 @@ pushChangesStack(int level)
 		csn = palloc0(sizeof(ChangesStackNode));
 		csn->changedVarsList = palloc0(sizeof(dlist_head));
 		csn->changedPacksList = palloc0(sizeof(dlist_head));
-
-		csn->ctx = AllocSetContextCreate(changesStackContext,
-										 PGV_MCXT_STACK_NODE,
-										 ALLOCSET_START_SMALL_SIZES);
 	}
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(oldcxt);
 		if (csn)
 		{
-			if (csn->ctx)
-				MemoryContextDelete(csn->ctx);
 			if (csn->changedPacksList)
 				pfree(csn->changedPacksList);
 			if (csn->changedVarsList)
@@ -3620,6 +3598,11 @@ pushChangesStack(int level)
 		}
 		if (new_stack)
 			pfree(new_stack);
+		if (!changesStack && changesStackContext)
+		{
+			MemoryContextDelete(changesStackContext);
+			changesStackContext = NULL;
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -3695,7 +3678,7 @@ addToChangesStack(TransObject *object, TransObjectType type)
 		ChangedObject *co;
 
 		csn = get_actual_changes_list();
-		co = makeChangedObject(object, csn->ctx);
+		co = makeChangedObject(object, changesStackContext);
 		dlist_push_head(type == TRANS_PACKAGE ? csn->changedPacksList :
 						csn->changedVarsList, &co->node);
 
@@ -3727,9 +3710,10 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 	while (!dlist_is_empty(list))
 	{
 		ChangedObject *co = dlist_container(ChangedObject, node,
-											dlist_head_node(list));
+											dlist_pop_head_node(list));
 		TransObject *object = co->object;
 
+		active_changed_object = co;
 		switch (action)
 		{
 			case ROLLBACK_TO_SAVEPOINT:
@@ -3763,24 +3747,12 @@ applyAction(Action action, TransObjectType type, dlist_head *list, bool sub)
 				releaseSavepoint(object, type, sub);
 				break;
 		}
-		(void) dlist_pop_head_node(list);
+		if (active_changed_object != NULL)
+		{
+			pfree(active_changed_object);
+			active_changed_object = NULL;
+		}
 	}
-}
-
-static size_t
-countUnpromotedObjects(dlist_head *list)
-{
-	dlist_iter	iter;
-	size_t		count = 0;
-
-	dlist_foreach(iter, list)
-	{
-		ChangedObject *co = dlist_container(ChangedObject, node, iter.cur);
-
-		if (!isObjectChangedInUpperTrans(co->object))
-			count++;
-	}
-	return count;
 }
 
 /*
@@ -3810,44 +3782,10 @@ processChanges(Action action, bool sub)
 	}
 
 	/*
-	 * Preallocate upper-level ChangedObject nodes before popping bottom_list
-	 * so an allocation failure leaves bottom_list intact for abort cleanup.
+	 * ChangedObject nodes live in changesStackContext, so promotion to an upper
+	 * stack level splices each node in place without allocating memory during
+	 * savepoint release, rollback, or transaction abort.
 	 */
-	Assert(dlist_is_empty(&prealloc_upper_objects));
-	dlist_init(&prealloc_upper_objects);
-	if (dlist_has_next(changesStack, dlist_head_node(changesStack)))
-	{
-		ChangesStackNode *cur_head = dlist_head_element(ChangesStackNode, node,
-														changesStack);
-		ChangesStackNode *upper_csn = dlist_container(ChangesStackNode, node,
-													  cur_head->node.next);
-		size_t		need_upper = 0;
-		size_t		i;
-
-		if (action == RELEASE_SAVEPOINT ||
-			(action == ROLLBACK_TO_SAVEPOINT && sub))
-			need_upper += countUnpromotedObjects(cur_head->changedVarsList);
-		if (action == RELEASE_SAVEPOINT || action == ROLLBACK_TO_SAVEPOINT)
-			need_upper += countUnpromotedObjects(cur_head->changedPacksList);
-
-		PG_TRY();
-		{
-			for (i = 0; i < need_upper; i++)
-			{
-				ChangedObject *co = makeChangedObject(NULL, upper_csn->ctx);
-
-				dlist_push_head(&prealloc_upper_objects, &co->node);
-			}
-		}
-		PG_CATCH();
-		{
-			freePreallocUpperObjects();
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
-
-	/* List removed from stack but we still can use it */
 	bottom_list = dlist_container(ChangesStackNode, node,
 								  dlist_pop_head_node(changesStack));
 
@@ -3858,14 +3796,17 @@ processChanges(Action action, bool sub)
 	}
 	PG_CATCH();
 	{
-		freePreallocUpperObjects();
+		if (active_changed_object != NULL)
+		{
+			pfree(active_changed_object);
+			active_changed_object = NULL;
+		}
 		resetVariablesCache();
 		if (!dlist_is_empty(bottom_list->changedVarsList) ||
 			!dlist_is_empty(bottom_list->changedPacksList))
 			dlist_push_head(changesStack, &bottom_list->node);
 		else
 		{
-			MemoryContextDelete(bottom_list->ctx);
 			pfree(bottom_list->changedVarsList);
 			pfree(bottom_list->changedPacksList);
 			pfree(bottom_list);
@@ -3874,12 +3815,8 @@ processChanges(Action action, bool sub)
 	}
 	PG_END_TRY();
 
-	freePreallocUpperObjects();
 	resetVariablesCache();
 
-	/* Remove changes list of current level */
-	MemoryContextDelete(bottom_list->ctx);
-	/* The node and list heads belong to the parent stack context. */
 	pfree(bottom_list->changedVarsList);
 	pfree(bottom_list->changedPacksList);
 	pfree(bottom_list);
@@ -4312,7 +4249,8 @@ pgvTransCallback(XactEvent event, void *arg)
 							   RELEASE_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_ABORT:
-				processChanges(ROLLBACK_TO_SAVEPOINT, false);
+				while (changesStack)
+					processChanges(ROLLBACK_TO_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_PARALLEL_PRE_COMMIT:
 				processChanges(shouldDiscardTransactionalOnCommit() ?
@@ -4320,7 +4258,8 @@ pgvTransCallback(XactEvent event, void *arg)
 							   RELEASE_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_PARALLEL_ABORT:
-				processChanges(ROLLBACK_TO_SAVEPOINT, false);
+				while (changesStack)
+					processChanges(ROLLBACK_TO_SAVEPOINT, false);
 				break;
 			case XACT_EVENT_PRE_PREPARE:
 

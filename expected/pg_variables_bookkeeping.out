@@ -229,3 +229,90 @@ BEGIN
     END LOOP;
 END
 $$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Rolling back or releasing child subtransactions must reuse stack chunks in
+-- place without allocating per-savepoint contexts or upper promotion buffers.
+DO $$
+DECLARE
+    base_total bigint;
+    base_used bigint;
+    during_total bigint;
+    after_total bigint;
+    after_used bigint;
+    i integer;
+BEGIN
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NULL THEN
+        RETURN;
+    END IF;
+
+    PERFORM pgv_set('stack_reuse', 'parent_keep', 77, true);
+
+    BEGIN
+        FOR i IN 1..500 LOOP
+            PERFORM pgv_set('stack_reuse', 'tmp_' || i, i, true);
+        END LOOP;
+        RAISE SQLSTATE 'ZX002';
+    EXCEPTION WHEN SQLSTATE 'ZX002' THEN
+        NULL;
+    END;
+
+    EXECUTE $q$
+        SELECT coalesce(sum(total_bytes), 0), coalesce(sum(used_bytes), 0)
+        FROM pg_catalog.pg_backend_memory_contexts
+        WHERE name LIKE 'pg_variables: changesStack%'
+    $q$ INTO base_total, base_used;
+
+    BEGIN
+        FOR i IN 1..500 LOOP
+            PERFORM pgv_set('stack_reuse', 'tmp_' || i, i, true);
+        END LOOP;
+        EXECUTE $q$
+            SELECT coalesce(sum(total_bytes), 0)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name LIKE 'pg_variables: changesStack%'
+        $q$ INTO during_total;
+        IF during_total > base_total THEN
+            RAISE EXCEPTION 'child subtransaction allocated % extra stack bytes instead of reusing freelist',
+                            during_total - base_total;
+        END IF;
+        RAISE SQLSTATE 'ZX002';
+    EXCEPTION WHEN SQLSTATE 'ZX002' THEN
+        NULL;
+    END;
+
+    -- Also verify promotion across nested subcommit reuses existing nodes.
+    BEGIN
+        FOR i IN 1..200 LOOP
+            PERFORM pgv_set('stack_reuse', 'prom_' || i, i, true);
+        END LOOP;
+    EXCEPTION WHEN SQLSTATE 'ZX002' THEN
+        NULL;
+    END;
+
+    EXECUTE $q$
+        SELECT coalesce(sum(total_bytes), 0), coalesce(sum(used_bytes), 0)
+        FROM pg_catalog.pg_backend_memory_contexts
+        WHERE name LIKE 'pg_variables: changesStack%'
+    $q$ INTO after_total, after_used;
+
+    IF after_total > base_total THEN
+        RAISE EXCEPTION 'subtransaction release/rollback grew changesStack (% -> %)',
+                        base_total, after_total;
+    END IF;
+    IF pgv_get('stack_reuse', 'parent_keep', NULL::integer) IS DISTINCT FROM 77 OR
+       pgv_exists('stack_reuse', 'tmp_1') OR
+       pgv_get('stack_reuse', 'prom_200', NULL::integer) IS DISTINCT FROM 200 THEN
+        RAISE EXCEPTION 'subtransaction stack reuse corrupted variable state';
+    END IF;
+END $$;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
