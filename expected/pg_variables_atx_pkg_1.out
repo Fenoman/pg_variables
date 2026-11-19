@@ -1734,11 +1734,19 @@ SELECT pgv_set('atx_parent_tx_mem', 'tx', repeat('x', 2048), true);
  
 (1 row)
 
+SELECT pgv_set('atx_parent_tx_mem_2', 'tx', repeat('y', 2048), true);
+ pgv_set 
+---------
+ 
+(1 row)
+
 DECLARE atx_ms_b CURSOR FOR SELECT pgv_select('atx_ms', 'b');
 MOVE 1 FROM atx_ms_b;
 DECLARE atx_ms_a_parent CURSOR FOR SELECT pgv_select('atx_ms', 'a');
 MOVE 1 FROM atx_ms_a_parent;
-DECLARE atx_st_parent CURSOR FOR SELECT (s).package AS pkg, (s).allocated_memory AS mem FROM pgv_stats() s;
+DECLARE atx_st_parent CURSOR FOR
+    SELECT (s).package AS pkg, (s).allocated_memory AS mem
+    FROM (SELECT pgv_stats() AS s) q;
 DO $$
 DECLARE
     r record;
@@ -1793,7 +1801,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM atx_st_rows WHERE pkg = 'atx_child_priv_tx') THEN
         RAISE EXCEPTION 'child ATX private package leaked into parent pgv_stats cursor';
     END IF;
-    IF (SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem') <= 0 THEN
+    IF COALESCE((SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem'), 0) <= 0 OR
+       COALESCE((SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem_2'), 0) <= 0 THEN
         RAISE EXCEPTION 'parent transactional package memory lost in materialized stats';
     END IF;
 END $$;
@@ -1806,6 +1815,391 @@ ERROR:  cursor "atx_ms_a_parent" does not exist
 COMMIT;
 WARNING:  there is no transaction in progress
 DROP TABLE atx_st_rows;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Irreversible parent package removal before a parent savepoint (including
+-- repeated pgv_free() inside a savepoint) must not block child ATX regular
+-- variable creation with the same name.
+BEGIN;
+SELECT pgv_set('atx_opp_irrev', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('atx_opp_irrev');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT sp_irrev_1;
+SELECT pgv_set('atx_opp_irrev', 'other', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_opp_irrev', 'x', 20, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+ROLLBACK TO sp_irrev_1;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+DO $$ BEGIN
+    IF pgv_get('atx_opp_irrev', 'x', NULL::integer, false) IS DISTINCT FROM 20 THEN
+        RAISE EXCEPTION 'child ATX regular variable failed over irreversible parent removal';
+    END IF;
+END $$;
+ERROR:  child ATX regular variable failed over irreversible parent removal
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+SAVEPOINT sp_irrev_2;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_set('atx_opp_irrev_3lvl', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('atx_opp_irrev_3lvl');
+ERROR:  unrecognized package "atx_opp_irrev_3lvl"
+SAVEPOINT sp_irrev_3;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_set('atx_opp_irrev_3lvl', 'other', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT sp_irrev_4;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_remove('atx_opp_irrev_3lvl');
+ERROR:  unrecognized package "atx_opp_irrev_3lvl"
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_opp_irrev_3lvl', 'x', 30, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+COMMIT;
+WARNING:  there is no transaction in progress
+SAVEPOINT sp_irrev_dbl_outer;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_set('atx_opp_dbl_rm', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('atx_opp_dbl_rm');
+ERROR:  unrecognized package "atx_opp_dbl_rm"
+SAVEPOINT sp_irrev_dbl_inner;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+SELECT pgv_set('atx_opp_dbl_rm', 'other', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_opp_dbl_rm', 'x', 40, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+COMMIT;
+WARNING:  there is no transaction in progress
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_get('atx_opp_dbl_rm', 'x', NULL::integer) AS atx_opp_dbl_rm_val;
+ atx_opp_dbl_rm_val 
+--------------------
+                 40
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+SELECT pgv_set('atx_lvl0_rm', 'seed', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('atx_lvl0_rm', 't0', 1, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_lvl0_rm');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+SELECT pgv_set('atx_lvl0_rm', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('atx_lvl0_rm');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT sp_lvl0_rm;
+ERROR:  SAVEPOINT can only be used in transaction blocks
+SELECT pgv_set('atx_lvl0_rm', 'x', 'retyped'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('atx_lvl0_rm', 'x', NULL::text) AS atx_lvl0_rm_retyped;
+ERROR:  unrecognized package "atx_lvl0_rm"
+ROLLBACK TO sp_lvl0_rm;
+ERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_lvl0_rm', 'x', 20, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_get('atx_lvl0_rm', 'x', NULL::integer) AS atx_lvl0_rm_val;
+ atx_lvl0_rm_val 
+-----------------
+              20
+(1 row)
+
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Committed child ATX package removal + regular recreation (either inside the
+-- child ATX or in the parent before parent ROLLBACK) must leave the surviving
+-- level-0 package with is_removed = false so a subsequent regular scalar update
+-- does not register changesStack bookkeeping (and allows 2PC).
+SELECT pgv_set('atx_prep_pkg', 'r', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_prep_other', 'v', 10, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_prep_pkg');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT pgv_set('atx_prep_pkg', 'r', 2, false);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+DO $$
+DECLARE
+    stack_contexts integer;
+BEGIN
+    PERFORM pgv_get('atx_prep_other', 'v', NULL::integer);
+    PERFORM pgv_set('atx_prep_pkg', 'r', 3, false);
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NOT NULL THEN
+        EXECUTE $q$
+            SELECT count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: changesStack'
+        $q$ INTO stack_contexts;
+        IF stack_contexts <> 0 THEN
+            RAISE EXCEPTION 'regular scalar update after ATX recreate created changesStack bookkeeping';
+        END IF;
+    END IF;
+END $$;
+COMMIT;
+WARNING:  there is no transaction in progress
+SELECT pgv_get('atx_prep_pkg', 'r', NULL::integer) AS atx_prep_pkg_val;
+ atx_prep_pkg_val 
+------------------
+                3
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+SELECT pgv_set('atx_prep_rb', 'seed', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_prep_rb_other', 'v', 10, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('atx_prep_rb', 't', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_remove('atx_prep_rb');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+SELECT pgv_set('atx_prep_rb', 'r', 2, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK;
+WARNING:  there is no transaction in progress
+BEGIN;
+DO $$
+DECLARE
+    stack_contexts integer;
+BEGIN
+    PERFORM pgv_get('atx_prep_rb_other', 'v', NULL::integer);
+    PERFORM pgv_set('atx_prep_rb', 'r', 3, false);
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NOT NULL THEN
+        EXECUTE $q$
+            SELECT count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: changesStack'
+        $q$ INTO stack_contexts;
+        IF stack_contexts <> 0 THEN
+            RAISE EXCEPTION 'regular scalar update after parent rollback created changesStack bookkeeping';
+        END IF;
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_get('atx_prep_rb', 'r', NULL::integer) AS atx_prep_rb_val;
+ atx_prep_rb_val 
+-----------------
+               3
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Removing a package inside a child ATX must not cut off an active parent
+-- unmaterialized pgv_stats() cursor, and must return the exact set of parent
+-- packages without duplicates.
+SELECT pgv_set('atx_pstat_1', 'v', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_pstat_2', 'v', 2, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('atx_pstat_3', 'v', 3, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+DECLARE atx_pstat_cur CURSOR FOR SELECT (pgv_stats()).package;
+DO $$
+DECLARE
+    first_pkg text;
+    c refcursor := 'atx_pstat_cur';
+BEGIN
+    FETCH c INTO first_pkg;
+    PERFORM set_config('pgv_test.atx_first_pkg', first_pkg, true);
+END $$;
+BEGIN AUTONOMOUS;
+ERROR:  syntax error at or near "AUTONOMOUS"
+LINE 1: BEGIN AUTONOMOUS;
+              ^
+SELECT pgv_set('atx_child_temp_pkg', 'v', 99, true);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT pgv_remove('atx_child_temp_pkg');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+DO $$
+DECLARE
+    pkg text;
+    seen text[] := ARRAY[current_setting('pgv_test.atx_first_pkg')];
+    sorted text[];
+    c refcursor := 'atx_pstat_cur';
+BEGIN
+    LOOP
+        FETCH c INTO pkg;
+        EXIT WHEN NOT FOUND;
+        seen := array_append(seen, pkg);
+    END LOOP;
+    SELECT array_agg(x ORDER BY x) INTO sorted FROM unnest(seen) AS x;
+    IF array_length(seen, 1) <> 3 OR
+       sorted IS DISTINCT FROM ARRAY['atx_pstat_1', 'atx_pstat_2', 'atx_pstat_3'] THEN
+        RAISE EXCEPTION 'child ATX pgv_remove corrupted parent pgv_stats cursor: seen=%', seen;
+    END IF;
+END $$;
+ERROR:  cursor "atx_pstat_cur" does not exist
+CONTEXT:  PL/pgSQL function inline_code_block line 9 at FETCH
+CLOSE atx_pstat_cur;
+ERROR:  cursor "atx_pstat_cur" does not exist
+COMMIT;
+WARNING:  there is no transaction in progress
 SELECT pgv_free();
  pgv_free 
 ----------

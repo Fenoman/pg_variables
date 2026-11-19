@@ -529,3 +529,262 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Removing an entire package at the same transaction level makes pre-removal
+-- transactional variables unreachable across nested savepoints, so opposite-mode
+-- regular creation inside a savepoint must succeed, whereas package removal
+-- inside a savepoint must still block opposite-mode creation when rollback can
+-- restore the pre-savepoint transactional value.
+BEGIN;
+SELECT pgv_set('opp_pkg_same', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('opp_pkg_same');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT opp_pkg_sp;
+SELECT pgv_set('opp_pkg_same', 'x', 20, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO opp_pkg_sp;
+DO $$ BEGIN
+ IF pgv_get('opp_pkg_same', 'x', NULL::integer) IS DISTINCT FROM 20 OR
+    (SELECT count(*) FROM pgv_list() WHERE package = 'opp_pkg_same' AND name = 'x') <> 1 THEN
+  RAISE EXCEPTION 'regular variable lost or duplicated after rolling back savepoint over irreversible package removal';
+ END IF;
+END $$;
+COMMIT;
+SELECT pgv_get('opp_pkg_same', 'x', NULL::integer) AS opp_pkg_same_after_commit;
+ opp_pkg_same_after_commit 
+---------------------------
+                        20
+(1 row)
+
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('opp_pkg_rev', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT opp_pkg_rm;
+SELECT pgv_remove('opp_pkg_rev');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT opp_pkg_recreate;
+SELECT pgv_set('opp_pkg_rev', 'x', 20, false);
+ERROR:  variable "x" already created as TRANSACTIONAL
+ROLLBACK TO opp_pkg_rm;
+SELECT pgv_get('opp_pkg_rev', 'x', NULL::integer) AS opp_pkg_rev_restored;
+ opp_pkg_rev_restored 
+----------------------
+                   10
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('opp_pkg_readd', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('opp_pkg_readd');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT opp_readd_sp1;
+SELECT pgv_set('opp_pkg_readd', 'x', 30, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT opp_readd_sp2;
+SELECT pgv_remove('opp_pkg_readd', 'x');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_set('opp_pkg_readd', 'x', 40, false);
+ERROR:  variable "x" already created as TRANSACTIONAL
+ROLLBACK TO opp_readd_sp2;
+SELECT pgv_get('opp_pkg_readd', 'x', NULL::integer) AS opp_pkg_readd_restored;
+ opp_pkg_readd_restored 
+------------------------
+                     30
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Repeated removal across a nested savepoint (e.g. pgv_free() after same-level
+-- pgv_remove()) must preserve the earliest contiguous removal boundary so
+-- opposite-mode creation is still allowed.
+BEGIN;
+SELECT pgv_set('opp_pkg_dbl_rm', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('opp_pkg_dbl_rm');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT opp_dbl_sp;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+SELECT pgv_set('opp_pkg_dbl_rm', 'x', 25, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+ROLLBACK TO opp_dbl_sp;
+SELECT pgv_get('opp_pkg_dbl_rm', 'x', NULL::integer) AS opp_pkg_dbl_rm_val;
+ opp_pkg_dbl_rm_val 
+--------------------
+                 25
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Recreating an irreversibly removed transactional variable with a new type or
+-- scalar/record mode must succeed, while reversible removal inside a savepoint
+-- must still reject type changes and restore the original value on rollback.
+BEGIN;
+SELECT pgv_set('retype_irrev', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_remove('retype_irrev');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SAVEPOINT sp_retype_1;
+SELECT pgv_set('retype_irrev', 'x', 'as_text'::text, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('retype_irrev', 'x', NULL::text) AS retype_after_pkg_rm;
+ retype_after_pkg_rm 
+---------------------
+ as_text
+(1 row)
+
+ROLLBACK TO sp_retype_1;
+SELECT pgv_exists('retype_irrev') AS retype_pkg_exists_after_rb;
+ retype_pkg_exists_after_rb 
+----------------------------
+ f
+(1 row)
+
+SELECT pgv_insert('retype_irrev', 'm', ROW(1, 'rec'::text), true);
+ pgv_insert 
+------------
+ 
+(1 row)
+
+SELECT pgv_remove('retype_irrev', 'm');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_set('retype_irrev', 'm', 77, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_get('retype_irrev', 'm', NULL::integer) AS retype_rec_to_scalar;
+ retype_rec_to_scalar 
+----------------------
+                   77
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+BEGIN;
+SELECT pgv_set('retype_rev', 'x', 10, true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SAVEPOINT sp_retype_rev;
+SELECT pgv_remove('retype_rev', 'x');
+ pgv_remove 
+------------
+ 
+(1 row)
+
+SELECT pgv_set('retype_rev', 'x', 'wrong'::text, true);
+ERROR:  variable "x" requires "integer" value
+ROLLBACK TO sp_retype_rev;
+SELECT pgv_get('retype_rev', 'x', NULL::integer) AS retype_rev_restored;
+ retype_rev_restored 
+---------------------
+                  10
+(1 row)
+
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

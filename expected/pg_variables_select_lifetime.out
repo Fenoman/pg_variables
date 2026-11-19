@@ -833,3 +833,207 @@ SELECT pgv_free();
  
 (1 row)
 
+-- Removing one package while an unmaterialized pgv_stats() cursor is open must
+-- not terminate the cursor before remaining packages are read. A removed
+-- package whose hash entry stays in packagesHash until transaction end reports
+-- 0 bytes of variable storage if visited later in the scan.
+SELECT pgv_set('stats_unmat_1', 'v', 1, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('stats_unmat_2', 'v', 2, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('stats_unmat_3', 'v', 3, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+DECLARE stats_unmat_cur CURSOR FOR
+    SELECT (s).package AS pkg, (s).allocated_memory AS mem
+    FROM (SELECT pgv_stats() AS s) q;
+DO $$
+DECLARE
+    r record;
+    first_pkg text;
+    drop_pkg text;
+    keep_pkg text;
+    seen_live text[] := ARRAY[]::text[];
+    total_rows integer := 0;
+    c refcursor := 'stats_unmat_cur';
+BEGIN
+    FETCH c INTO r;
+    first_pkg := r.pkg;
+    IF r.mem <= 0 THEN
+        RAISE EXCEPTION 'expected positive memory for %, got %', r.pkg, r.mem;
+    END IF;
+    seen_live := array_append(seen_live, first_pkg);
+    total_rows := 1;
+    drop_pkg := CASE WHEN first_pkg = 'stats_unmat_1' THEN 'stats_unmat_2' ELSE 'stats_unmat_1' END;
+    keep_pkg := CASE
+        WHEN first_pkg <> 'stats_unmat_3' AND drop_pkg <> 'stats_unmat_3' THEN 'stats_unmat_3'
+        ELSE 'stats_unmat_2'
+    END;
+    PERFORM pgv_remove(drop_pkg);
+    LOOP
+        FETCH c INTO r;
+        EXIT WHEN NOT FOUND;
+        total_rows := total_rows + 1;
+        IF r.pkg = drop_pkg THEN
+            IF r.mem <> 0 THEN
+                RAISE EXCEPTION 'removed package % reported non-zero memory %', r.pkg, r.mem;
+            END IF;
+        ELSE
+            IF r.mem <= 0 OR r.pkg = ANY(seen_live) THEN
+                RAISE EXCEPTION 'unexpected live stats row % mem=% seen=%', r.pkg, r.mem, seen_live;
+            END IF;
+            seen_live := array_append(seen_live, r.pkg);
+        END IF;
+    END LOOP;
+    IF array_length(seen_live, 1) <> 2 OR NOT (keep_pkg = ANY(seen_live)) OR total_rows <> 3 THEN
+        RAISE EXCEPTION 'unexpected stats cursor rows: live=% total=%', seen_live, total_rows;
+    END IF;
+END $$;
+CLOSE stats_unmat_cur;
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+-- Opening a nested pgv_stats() scan materializes unread parent rows (including
+-- allocated_memory) on the first nested fetch, before RELEASE SAVEPOINT, while
+-- a streaming parent cursor without an active scan at the released savepoint
+-- stays unmaterialized across RELEASE SAVEPOINT.
+SELECT pgv_set('stats_early_1', 'v', 'a'::text, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('stats_early_2', 'v', 'b'::text, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM set_config('pgv_test.mem_0', (SELECT max(allocated_memory)::text FROM pgv_stats()), false);
+END $$;
+BEGIN;
+DECLARE stats_early_parent CURSOR FOR
+    SELECT (s).package AS pkg, (s).allocated_memory AS mem
+    FROM (SELECT pgv_stats() AS s) q;
+DO $$
+DECLARE
+    first_row record;
+    rem_pkg text;
+    cp refcursor := 'stats_early_parent';
+BEGIN
+    FETCH cp INTO first_row;
+    rem_pkg := CASE WHEN first_row.pkg = 'stats_early_1' THEN 'stats_early_2' ELSE 'stats_early_1' END;
+    PERFORM pgv_set(rem_pkg, 'mid', repeat('y', 100000), true);
+    PERFORM set_config('pgv_test.rem_pkg', rem_pkg, true);
+END $$;
+SAVEPOINT early_mat_sp;
+DECLARE stats_early_child CURSOR FOR SELECT (pgv_stats()).package;
+MOVE 1 FROM stats_early_child;
+CLOSE stats_early_child;
+SELECT pgv_set(current_setting('pgv_test.rem_pkg'), 'big', repeat('z', 300000), true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+RELEASE SAVEPOINT early_mat_sp;
+DO $$
+DECLARE
+    r record;
+    mem_0 bigint := current_setting('pgv_test.mem_0')::bigint;
+    mem_live bigint;
+    rem_pkg text := current_setting('pgv_test.rem_pkg');
+    cp refcursor := 'stats_early_parent';
+BEGIN
+    FETCH cp INTO r;
+    CLOSE cp;
+    SELECT allocated_memory INTO STRICT mem_live FROM pgv_stats() WHERE package = rem_pkg;
+    IF r.pkg IS DISTINCT FROM rem_pkg THEN
+        RAISE EXCEPTION 'unexpected remaining package %, expected %', r.pkg, rem_pkg;
+    END IF;
+    IF r.mem <= mem_0 + 50000 OR r.mem >= mem_live - 200000 THEN
+        RAISE EXCEPTION 'expected intermediate snapshot (% < mem < %), got % (live=%)',
+            mem_0 + 50000, mem_live - 200000, r.mem, mem_live;
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+
+SELECT pgv_set('stats_rel_1', 'v', 'a'::text, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+SELECT pgv_set('stats_rel_2', 'v', 'b'::text, false);
+ pgv_set 
+---------
+ 
+(1 row)
+
+BEGIN;
+DECLARE stats_rel_cur CURSOR FOR
+    SELECT (s).package AS pkg, (s).allocated_memory AS mem
+    FROM (SELECT pgv_stats() AS s) q;
+DO $$
+DECLARE
+    first_row record;
+    rem_pkg text;
+    c refcursor := 'stats_rel_cur';
+BEGIN
+    FETCH c INTO first_row;
+    rem_pkg := CASE WHEN first_row.pkg = 'stats_rel_1' THEN 'stats_rel_2' ELSE 'stats_rel_1' END;
+    PERFORM set_config('pgv_test.rel_rem_pkg', rem_pkg, true);
+END $$;
+SAVEPOINT sp_rel_empty;
+RELEASE SAVEPOINT sp_rel_empty;
+SELECT pgv_set(current_setting('pgv_test.rel_rem_pkg'), 'big', repeat('z', 200000), true);
+ pgv_set 
+---------
+ 
+(1 row)
+
+DO $$
+DECLARE
+    r record;
+    mem_live bigint;
+    rem_pkg text := current_setting('pgv_test.rel_rem_pkg');
+    c refcursor := 'stats_rel_cur';
+BEGIN
+    FETCH c INTO r;
+    CLOSE c;
+    SELECT allocated_memory INTO STRICT mem_live FROM pgv_stats() WHERE package = rem_pkg;
+    IF r.pkg IS DISTINCT FROM rem_pkg OR r.mem <> mem_live THEN
+        RAISE EXCEPTION 'empty RELEASE SAVEPOINT unexpectedly froze stats scan: got (%, %), expected (%, %)',
+            r.pkg, r.mem, rem_pkg, mem_live;
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_free();
+ pgv_free 
+----------
+ 
+(1 row)
+

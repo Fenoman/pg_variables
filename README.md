@@ -373,19 +373,34 @@ PostgreSQL materializes holdable cursors before transaction end.  Therefore, a
 the materialized in-transaction snapshot after `COMMIT`, even though subsequent
 `pgv_*` calls see the discarded or restored state.
 
-Active record and statistics cursors continue after `RELEASE SAVEPOINT` while
-their source collection state remains alive:
+Active record and statistics cursors continue across nested savepoints and
+`RELEASE SAVEPOINT` while their source collection state remains alive:
 
-- Full record scans opened inside the savepoint retain references to unread
-  entries: updates to retained entries remain visible, subsequent inserts are
-  excluded, and key deletion remains blocked until the scan closes.
-- Statistics scans capture unread rows at `RELEASE SAVEPOINT`.
+- Unread entries of an active scan are materialized when a second scan of the
+  same hash table (`pgv_select()` on the same collection or `pgv_stats()`)
+  starts at another subtransaction level within the same autonomous transaction,
+  or at `RELEASE SAVEPOINT` when the released savepoint holds an active scan of
+  that hash table (for example, a scan opened inside the savepoint that stays
+  open across `RELEASE SAVEPOINT`).
+- Materialized full record scans retain references to unread entries: updates to
+  retained entries remain visible, subsequent inserts are excluded, and key
+  deletion remains blocked until the scan closes.
+- Materialized statistics scans capture unread `(package, allocated_memory)`
+  rows at that materialization point (first nested `pgv_stats()` call in the
+  same autonomous transaction, or `RELEASE SAVEPOINT` with an active scan at the
+  released savepoint level).
+- Removing a single package does not terminate an active unmaterialized
+  `pgv_stats()` scan: if that package's hash entry remains in `packagesHash`
+  until transaction end, the continuing scan may still return a row for it
+  (with `0` bytes once regular storage is freed and no transactional variable
+  context remains, or with the retained transactional context size until
+  transaction end).
 - Removing or replacing the source collection state ends its record scans.
 - At most 64 active hash-table scans (`pgv_select()` full collection scans and
   `pgv_stats()`) may stay registered concurrently in a backend so server
   hash-scan slots remain available for portal and subtransaction cleanup.
-  Cursors already materialized on `RELEASE SAVEPOINT` or `WITH HOLD` commit do
-  not hold an active hash scan.
+  Cursors already materialized (on a nested same-table scan, `RELEASE SAVEPOINT`,
+  or `WITH HOLD` commit) do not hold an active hash scan.
 
 Altering or dropping a named composite type (`ALTER TYPE`, `DROP TYPE`) while
 values of that type are stored in scalar, array or nested record variables is

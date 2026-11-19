@@ -875,11 +875,14 @@ SELECT pgv_insert('atx_ms', 'a', ROW(20), false);
 CREATE TEMP TABLE atx_st_rows(pkg text, mem bigint);
 BEGIN;
 SELECT pgv_set('atx_parent_tx_mem', 'tx', repeat('x', 2048), true);
+SELECT pgv_set('atx_parent_tx_mem_2', 'tx', repeat('y', 2048), true);
 DECLARE atx_ms_b CURSOR FOR SELECT pgv_select('atx_ms', 'b');
 MOVE 1 FROM atx_ms_b;
 DECLARE atx_ms_a_parent CURSOR FOR SELECT pgv_select('atx_ms', 'a');
 MOVE 1 FROM atx_ms_a_parent;
-DECLARE atx_st_parent CURSOR FOR SELECT (s).package AS pkg, (s).allocated_memory AS mem FROM pgv_stats() s;
+DECLARE atx_st_parent CURSOR FOR
+    SELECT (s).package AS pkg, (s).allocated_memory AS mem
+    FROM (SELECT pgv_stats() AS s) q;
 DO $$
 DECLARE
     r record;
@@ -922,7 +925,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM atx_st_rows WHERE pkg = 'atx_child_priv_tx') THEN
         RAISE EXCEPTION 'child ATX private package leaked into parent pgv_stats cursor';
     END IF;
-    IF (SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem') <= 0 THEN
+    IF COALESCE((SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem'), 0) <= 0 OR
+       COALESCE((SELECT mem FROM atx_st_rows WHERE pkg = 'atx_parent_tx_mem_2'), 0) <= 0 THEN
         RAISE EXCEPTION 'parent transactional package memory lost in materialized stats';
     END IF;
 END $$;
@@ -930,4 +934,168 @@ CLOSE atx_st_parent;
 CLOSE atx_ms_a_parent;
 COMMIT;
 DROP TABLE atx_st_rows;
+SELECT pgv_free();
+
+-- Irreversible parent package removal before a parent savepoint (including
+-- repeated pgv_free() inside a savepoint) must not block child ATX regular
+-- variable creation with the same name.
+BEGIN;
+SELECT pgv_set('atx_opp_irrev', 'x', 10, true);
+SELECT pgv_remove('atx_opp_irrev');
+SAVEPOINT sp_irrev_1;
+SELECT pgv_set('atx_opp_irrev', 'other', 1, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_opp_irrev', 'x', 20, false);
+COMMIT;
+ROLLBACK TO sp_irrev_1;
+DO $$ BEGIN
+    IF pgv_get('atx_opp_irrev', 'x', NULL::integer, false) IS DISTINCT FROM 20 THEN
+        RAISE EXCEPTION 'child ATX regular variable failed over irreversible parent removal';
+    END IF;
+END $$;
+SAVEPOINT sp_irrev_2;
+SELECT pgv_set('atx_opp_irrev_3lvl', 'x', 10, true);
+SELECT pgv_remove('atx_opp_irrev_3lvl');
+SAVEPOINT sp_irrev_3;
+SELECT pgv_set('atx_opp_irrev_3lvl', 'other', 1, true);
+SAVEPOINT sp_irrev_4;
+SELECT pgv_remove('atx_opp_irrev_3lvl');
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_opp_irrev_3lvl', 'x', 30, false);
+COMMIT;
+SAVEPOINT sp_irrev_dbl_outer;
+SELECT pgv_set('atx_opp_dbl_rm', 'x', 10, true);
+SELECT pgv_remove('atx_opp_dbl_rm');
+SAVEPOINT sp_irrev_dbl_inner;
+SELECT pgv_free();
+SELECT pgv_set('atx_opp_dbl_rm', 'other', 1, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_opp_dbl_rm', 'x', 40, false);
+COMMIT;
+COMMIT;
+SELECT pgv_get('atx_opp_dbl_rm', 'x', NULL::integer) AS atx_opp_dbl_rm_val;
+SELECT pgv_free();
+
+SELECT pgv_set('atx_lvl0_rm', 'seed', 1, false);
+BEGIN;
+SELECT pgv_set('atx_lvl0_rm', 't0', 1, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_lvl0_rm');
+COMMIT;
+SELECT pgv_set('atx_lvl0_rm', 'x', 10, true);
+SELECT pgv_remove('atx_lvl0_rm');
+SAVEPOINT sp_lvl0_rm;
+SELECT pgv_set('atx_lvl0_rm', 'x', 'retyped'::text, true);
+SELECT pgv_get('atx_lvl0_rm', 'x', NULL::text) AS atx_lvl0_rm_retyped;
+ROLLBACK TO sp_lvl0_rm;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_lvl0_rm', 'x', 20, false);
+COMMIT;
+SELECT pgv_get('atx_lvl0_rm', 'x', NULL::integer) AS atx_lvl0_rm_val;
+COMMIT;
+SELECT pgv_free();
+
+-- Committed child ATX package removal + regular recreation (either inside the
+-- child ATX or in the parent before parent ROLLBACK) must leave the surviving
+-- level-0 package with is_removed = false so a subsequent regular scalar update
+-- does not register changesStack bookkeeping (and allows 2PC).
+SELECT pgv_set('atx_prep_pkg', 'r', 1, false);
+SELECT pgv_set('atx_prep_other', 'v', 10, false);
+BEGIN;
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_prep_pkg');
+SELECT pgv_set('atx_prep_pkg', 'r', 2, false);
+COMMIT;
+DO $$
+DECLARE
+    stack_contexts integer;
+BEGIN
+    PERFORM pgv_get('atx_prep_other', 'v', NULL::integer);
+    PERFORM pgv_set('atx_prep_pkg', 'r', 3, false);
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NOT NULL THEN
+        EXECUTE $q$
+            SELECT count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: changesStack'
+        $q$ INTO stack_contexts;
+        IF stack_contexts <> 0 THEN
+            RAISE EXCEPTION 'regular scalar update after ATX recreate created changesStack bookkeeping';
+        END IF;
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_get('atx_prep_pkg', 'r', NULL::integer) AS atx_prep_pkg_val;
+SELECT pgv_free();
+
+SELECT pgv_set('atx_prep_rb', 'seed', 1, false);
+SELECT pgv_set('atx_prep_rb_other', 'v', 10, false);
+BEGIN;
+SELECT pgv_set('atx_prep_rb', 't', 10, true);
+BEGIN AUTONOMOUS;
+SELECT pgv_remove('atx_prep_rb');
+COMMIT;
+SELECT pgv_set('atx_prep_rb', 'r', 2, false);
+ROLLBACK;
+BEGIN;
+DO $$
+DECLARE
+    stack_contexts integer;
+BEGIN
+    PERFORM pgv_get('atx_prep_rb_other', 'v', NULL::integer);
+    PERFORM pgv_set('atx_prep_rb', 'r', 3, false);
+    IF to_regclass('pg_catalog.pg_backend_memory_contexts') IS NOT NULL THEN
+        EXECUTE $q$
+            SELECT count(*)
+            FROM pg_catalog.pg_backend_memory_contexts
+            WHERE name = 'pg_variables: changesStack'
+        $q$ INTO stack_contexts;
+        IF stack_contexts <> 0 THEN
+            RAISE EXCEPTION 'regular scalar update after parent rollback created changesStack bookkeeping';
+        END IF;
+    END IF;
+END $$;
+COMMIT;
+SELECT pgv_get('atx_prep_rb', 'r', NULL::integer) AS atx_prep_rb_val;
+SELECT pgv_free();
+
+-- Removing a package inside a child ATX must not cut off an active parent
+-- unmaterialized pgv_stats() cursor, and must return the exact set of parent
+-- packages without duplicates.
+SELECT pgv_set('atx_pstat_1', 'v', 1, false);
+SELECT pgv_set('atx_pstat_2', 'v', 2, false);
+SELECT pgv_set('atx_pstat_3', 'v', 3, false);
+BEGIN;
+DECLARE atx_pstat_cur CURSOR FOR SELECT (pgv_stats()).package;
+DO $$
+DECLARE
+    first_pkg text;
+    c refcursor := 'atx_pstat_cur';
+BEGIN
+    FETCH c INTO first_pkg;
+    PERFORM set_config('pgv_test.atx_first_pkg', first_pkg, true);
+END $$;
+BEGIN AUTONOMOUS;
+SELECT pgv_set('atx_child_temp_pkg', 'v', 99, true);
+SELECT pgv_remove('atx_child_temp_pkg');
+COMMIT;
+DO $$
+DECLARE
+    pkg text;
+    seen text[] := ARRAY[current_setting('pgv_test.atx_first_pkg')];
+    sorted text[];
+    c refcursor := 'atx_pstat_cur';
+BEGIN
+    LOOP
+        FETCH c INTO pkg;
+        EXIT WHEN NOT FOUND;
+        seen := array_append(seen, pkg);
+    END LOOP;
+    SELECT array_agg(x ORDER BY x) INTO sorted FROM unnest(seen) AS x;
+    IF array_length(seen, 1) <> 3 OR
+       sorted IS DISTINCT FROM ARRAY['atx_pstat_1', 'atx_pstat_2', 'atx_pstat_3'] THEN
+        RAISE EXCEPTION 'child ATX pgv_remove corrupted parent pgv_stats cursor: seen=%', seen;
+    END IF;
+END $$;
+CLOSE atx_pstat_cur;
+COMMIT;
 SELECT pgv_free();

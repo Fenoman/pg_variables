@@ -83,3 +83,20 @@ SELECT k, tags FROM pgv_select('named_mix', 'r') AS x(k integer, tags text[]) OR
 COMMIT;
 DROP TABLE rec_named_arr;
 SELECT pgv_free();
+
+-- pgv_update must pass the coerced tuple pointer when converting an UNKNOWN
+-- field to text, regardless of C argument evaluation order.
+SELECT pgv_insert('upd_unk', 'reg_r', ROW(1, 'initial'::text), false);
+SELECT pgv_insert('upd_unk', 'reg_r', ROW(2, 'keep'::text), false);
+SELECT pgv_update('upd_unk', 'reg_r', ROW(1, 'coerced_reg_update'));
+SELECT k, v FROM pgv_select('upd_unk', 'reg_r') AS x(k integer, v text) ORDER BY k;
+
+BEGIN;
+SELECT pgv_insert('upd_unk', 'tx_r', ROW(1, 'tx_init'::text), true);
+SAVEPOINT sp_upd_unk;
+SELECT pgv_update('upd_unk', 'tx_r', ROW(1, 'coerced_tx_update'));
+SELECT k, v FROM pgv_select('upd_unk', 'tx_r') AS x(k integer, v text) ORDER BY k;
+ROLLBACK TO sp_upd_unk;
+SELECT k, v FROM pgv_select('upd_unk', 'tx_r') AS x(k integer, v text) ORDER BY k;
+COMMIT;
+SELECT pgv_free();
